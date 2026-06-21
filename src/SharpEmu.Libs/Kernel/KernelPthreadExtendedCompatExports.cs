@@ -490,6 +490,37 @@ public static class KernelPthreadExtendedCompatExports
     }
 
     [SysAbiExport(
+        Nid = "-quPa4SEJUw",
+        ExportName = "scePthreadAttrGetstack",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadAttrGetstack(CpuContext ctx)
+    {
+        var attrAddress = ctx[CpuRegister.Rdi];
+        var outStackAddressPointer = ctx[CpuRegister.Rsi];
+        var outStackSizeAddress = ctx[CpuRegister.Rdx];
+        if (attrAddress == 0 || outStackAddressPointer == 0 || outStackSizeAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        PthreadAttrState state;
+        lock (_stateGate)
+        {
+            state = GetOrCreateAttrStateLocked(attrAddress);
+        }
+
+        if (!ctx.TryWriteUInt64(outStackAddressPointer, state.StackAddress) ||
+            !ctx.TryWriteUInt64(outStackSizeAddress, state.StackSize))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "-fA+7ZlGDQs",
         ExportName = "scePthreadAttrGetstacksize",
         Target = Generation.Gen4 | Generation.Gen5,

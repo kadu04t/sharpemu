@@ -13,7 +13,7 @@ public static class KernelEventQueueCompatExports
 
     private static readonly object _eventQueueGate = new();
     private static readonly HashSet<ulong> _eventQueues = new();
-    private static readonly Dictionary<ulong, Queue<KernelQueuedEvent>> _pendingEvents = new();
+    private static readonly Dictionary<ulong, LinkedList<KernelQueuedEvent>> _pendingEvents = new();
     private static long _nextEventQueueHandle = 1;
 
     public readonly record struct KernelQueuedEvent(
@@ -41,7 +41,7 @@ public static class KernelEventQueueCompatExports
         lock (_eventQueueGate)
         {
             _eventQueues.Add(handle);
-            _pendingEvents[handle] = new Queue<KernelQueuedEvent>();
+            _pendingEvents[handle] = new LinkedList<KernelQueuedEvent>();
         }
 
         if (!ctx.TryWriteUInt64(outAddress, handle))
@@ -225,11 +225,70 @@ public static class KernelEventQueueCompatExports
 
             if (!_pendingEvents.TryGetValue(handle, out var queue))
             {
-                queue = new Queue<KernelQueuedEvent>();
+                queue = new LinkedList<KernelQueuedEvent>();
                 _pendingEvents[handle] = queue;
             }
 
-            queue.Enqueue(queuedEvent);
+            queue.AddLast(queuedEvent);
+            return true;
+        }
+    }
+
+    public static bool TriggerDisplayEvent(
+        ulong handle,
+        ulong ident,
+        short filter,
+        ulong eventHint,
+        ulong userData)
+    {
+        lock (_eventQueueGate)
+        {
+            if (!_eventQueues.Contains(handle))
+            {
+                return false;
+            }
+
+            if (!_pendingEvents.TryGetValue(handle, out var events))
+            {
+                events = new LinkedList<KernelQueuedEvent>();
+                _pendingEvents[handle] = events;
+            }
+
+            LinkedListNode<KernelQueuedEvent>? pendingNode = null;
+            for (var node = events.First; node is not null; node = node.Next)
+            {
+                if (node.Value.Ident == ident && node.Value.Filter == filter)
+                {
+                    pendingNode = node;
+                    break;
+                }
+            }
+
+            var count = 1UL;
+            if (pendingNode is not null)
+            {
+                count = Math.Min(((pendingNode.Value.Data >> 12) & 0xFUL) + 1, 0xFUL);
+            }
+
+            var timeBits = unchecked((ulong)Environment.TickCount64) & 0xFFFUL;
+            var eventData = timeBits | (count << 12) | (eventHint & 0xFFFF_FFFF_FFFF_0000UL);
+            var triggeredEvent = new KernelQueuedEvent(
+                ident,
+                filter,
+                0x20,
+                0,
+                eventData,
+                userData);
+
+            if (pendingNode is not null)
+            {
+                pendingNode.Value = triggeredEvent;
+            }
+            else
+            {
+                events.AddLast(triggeredEvent);
+            }
+
             return true;
         }
     }
@@ -253,7 +312,8 @@ public static class KernelEventQueueCompatExports
             events = new KernelQueuedEvent[count];
             for (var i = 0; i < count; i++)
             {
-                events[i] = queue.Dequeue();
+                events[i] = queue.First!.Value;
+                queue.RemoveFirst();
             }
         }
 

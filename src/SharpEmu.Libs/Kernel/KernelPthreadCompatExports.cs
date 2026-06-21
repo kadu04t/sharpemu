@@ -15,9 +15,9 @@ public static class KernelPthreadCompatExports
     private const int MutexTypeNormal = 3;
     private const int MutexTypeAdaptiveNp = 4;
     private const ulong StaticAdaptiveMutexInitializer = 1;
-    private const ulong SyntheticMutexHandleBase = 0x00006000_0000_0000;
-    private const ulong SyntheticMutexAttrHandleBase = 0x00006001_0000_0000;
-    private const ulong SyntheticCondHandleBase = 0x00006002_0000_0000;
+    private const int MutexObjectSize = 0x100;
+    private const int MutexAttrObjectSize = 0x40;
+    private const int CondObjectSize = 0x100;
     private const int DefaultSpuriousCondWakeMilliseconds = 1;
 
     private static readonly object _stateGate = new();
@@ -25,9 +25,6 @@ public static class KernelPthreadCompatExports
     private static readonly Dictionary<ulong, PthreadMutexAttrState> _mutexAttrStates = new();
     private static readonly Dictionary<ulong, PthreadCondState> _condStates = new();
     private static readonly HashSet<ulong> _condAttrStates = new();
-    private static long _nextSyntheticMutexHandleId = 1;
-    private static long _nextSyntheticMutexAttrHandleId = 1;
-    private static long _nextSyntheticCondHandleId = 1;
 
     private sealed class PthreadMutexState
     {
@@ -357,14 +354,34 @@ public static class KernelPthreadCompatExports
             Protocol = attr.Protocol,
         };
 
-        var syntheticHandle = AllocateSyntheticHandle(SyntheticMutexHandleBase, ref _nextSyntheticMutexHandleId);
+        if (!TryAllocateOpaqueObject(ctx, MutexObjectSize, out var handle))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+        if (!InitializeMutexObject(ctx, handle, state))
+        {
+            state.Semaphore.Dispose();
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         lock (_stateGate)
         {
             _mutexStates[mutexAddress] = state;
-            _mutexStates[syntheticHandle] = state;
+            _mutexStates[handle] = state;
         }
 
-        _ = ctx.TryWriteUInt64(mutexAddress, syntheticHandle);
+        if (!ctx.TryWriteUInt64(mutexAddress, handle))
+        {
+            lock (_stateGate)
+            {
+                _mutexStates.Remove(mutexAddress);
+                _mutexStates.Remove(handle);
+            }
+
+            state.Semaphore.Dispose();
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -533,14 +550,34 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var syntheticHandle = AllocateSyntheticHandle(SyntheticMutexAttrHandleBase, ref _nextSyntheticMutexAttrHandleId);
-        lock (_stateGate)
+        if (!TryAllocateOpaqueObject(ctx, MutexAttrObjectSize, out var handle))
         {
-            _mutexAttrStates[attrAddress] = new PthreadMutexAttrState(MutexTypeDefault, 0);
-            _mutexAttrStates[syntheticHandle] = new PthreadMutexAttrState(MutexTypeDefault, 0);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        _ = ctx.TryWriteUInt64(attrAddress, syntheticHandle);
+        var initialState = new PthreadMutexAttrState(MutexTypeDefault, 0);
+        if (!WriteMutexAttrObject(ctx, handle, initialState))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        lock (_stateGate)
+        {
+            _mutexAttrStates[attrAddress] = initialState;
+            _mutexAttrStates[handle] = initialState;
+        }
+
+        if (!ctx.TryWriteUInt64(attrAddress, handle))
+        {
+            lock (_stateGate)
+            {
+                _mutexAttrStates.Remove(attrAddress);
+                _mutexAttrStates.Remove(handle);
+            }
+
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -572,6 +609,7 @@ public static class KernelPthreadCompatExports
         }
 
         var resolvedAddress = ResolveMutexAttrHandle(ctx, attrAddress);
+        PthreadMutexAttrState updatedState;
         lock (_stateGate)
         {
             if (!_mutexAttrStates.TryGetValue(resolvedAddress, out var state))
@@ -579,14 +617,17 @@ public static class KernelPthreadCompatExports
                 state = new PthreadMutexAttrState(MutexTypeDefault, 0);
             }
 
-            _mutexAttrStates[resolvedAddress] = state with { Type = NormalizeMutexType(type) };
+            updatedState = state with { Type = NormalizeMutexType(type) };
+            _mutexAttrStates[resolvedAddress] = updatedState;
             if (resolvedAddress != attrAddress)
             {
-                _mutexAttrStates[attrAddress] = _mutexAttrStates[resolvedAddress];
+                _mutexAttrStates[attrAddress] = updatedState;
             }
         }
 
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return WriteMutexAttrObject(ctx, resolvedAddress, updatedState)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
     }
 
     private static int PthreadMutexattrSetprotocolCore(CpuContext ctx, ulong attrAddress, int protocol)
@@ -597,6 +638,7 @@ public static class KernelPthreadCompatExports
         }
 
         var resolvedAddress = ResolveMutexAttrHandle(ctx, attrAddress);
+        PthreadMutexAttrState updatedState;
         lock (_stateGate)
         {
             if (!_mutexAttrStates.TryGetValue(resolvedAddress, out var state))
@@ -604,14 +646,17 @@ public static class KernelPthreadCompatExports
                 state = new PthreadMutexAttrState(MutexTypeDefault, 0);
             }
 
-            _mutexAttrStates[resolvedAddress] = state with { Protocol = protocol };
+            updatedState = state with { Protocol = protocol };
+            _mutexAttrStates[resolvedAddress] = updatedState;
             if (resolvedAddress != attrAddress)
             {
-                _mutexAttrStates[attrAddress] = _mutexAttrStates[resolvedAddress];
+                _mutexAttrStates[attrAddress] = updatedState;
             }
         }
 
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return WriteMutexAttrObject(ctx, resolvedAddress, updatedState)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
     }
 
     private static ulong ResolveMutexHandle(CpuContext ctx, ulong mutexAddress)
@@ -703,14 +748,6 @@ public static class KernelPthreadCompatExports
             return 0;
         }
 
-        lock (_stateGate)
-        {
-            if (_mutexAttrStates.ContainsKey(attrAddress))
-            {
-                return attrAddress;
-            }
-        }
-
         if (ctx.TryReadUInt64(attrAddress, out var pointedHandle) && pointedHandle != 0)
         {
             lock (_stateGate)
@@ -719,6 +756,14 @@ public static class KernelPthreadCompatExports
                 {
                     return pointedHandle;
                 }
+            }
+        }
+
+        lock (_stateGate)
+        {
+            if (_mutexAttrStates.ContainsKey(attrAddress))
+            {
+                return attrAddress;
             }
         }
 
@@ -816,23 +861,60 @@ public static class KernelPthreadCompatExports
         }
 
         var createdState = new PthreadCondState();
-        var syntheticHandle = AllocateSyntheticHandle(SyntheticCondHandleBase, ref _nextSyntheticCondHandleId);
+        if (!TryAllocateOpaqueObject(ctx, CondObjectSize, out var handle))
+        {
+            return false;
+        }
+
         lock (_stateGate)
         {
             _condStates[condAddress] = createdState;
-            _condStates[syntheticHandle] = createdState;
+            _condStates[handle] = createdState;
         }
 
-        _ = ctx.TryWriteUInt64(condAddress, syntheticHandle);
-        resolvedAddress = syntheticHandle;
+        if (!ctx.TryWriteUInt64(condAddress, handle))
+        {
+            lock (_stateGate)
+            {
+                _condStates.Remove(condAddress);
+                _condStates.Remove(handle);
+            }
+
+            return false;
+        }
+
+        resolvedAddress = handle;
         state = createdState;
         return true;
     }
 
-    private static ulong AllocateSyntheticHandle(ulong baseAddress, ref long nextId)
+    private static bool TryAllocateOpaqueObject(CpuContext ctx, int size, out ulong address)
     {
-        var id = unchecked((ulong)Interlocked.Increment(ref nextId));
-        return baseAddress + (id << 4);
+        address = 0;
+        if (ctx.Memory is not IGuestMemoryAllocator allocator ||
+            !allocator.TryAllocateGuestMemory((ulong)size, alignment: 0x10, out address))
+        {
+            return false;
+        }
+
+        Span<byte> initialData = stackalloc byte[size];
+        initialData.Clear();
+        return ctx.Memory.TryWrite(address, initialData);
+    }
+
+    private static bool InitializeMutexObject(CpuContext ctx, ulong address, PthreadMutexState state) =>
+        TryWriteUInt32(ctx, address + 0x20, unchecked((uint)state.Type)) &&
+        TryWriteUInt32(ctx, address + 0x3C, unchecked((uint)state.Protocol));
+
+    private static bool WriteMutexAttrObject(CpuContext ctx, ulong address, PthreadMutexAttrState state) =>
+        TryWriteUInt32(ctx, address, unchecked((uint)state.Type)) &&
+        TryWriteUInt32(ctx, address + 4, unchecked((uint)state.Protocol));
+
+    private static bool TryWriteUInt32(CpuContext ctx, ulong address, uint value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        BitConverter.TryWriteBytes(bytes, value);
+        return ctx.Memory.TryWrite(address, bytes);
     }
 
     private static int PthreadCondInitCore(CpuContext ctx, ulong condAddress)
@@ -842,15 +924,29 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var syntheticHandle = AllocateSyntheticHandle(SyntheticCondHandleBase, ref _nextSyntheticCondHandleId);
+        if (!TryAllocateOpaqueObject(ctx, CondObjectSize, out var handle))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         lock (_stateGate)
         {
             var state = new PthreadCondState();
             _condStates[condAddress] = state;
-            _condStates[syntheticHandle] = state;
+            _condStates[handle] = state;
         }
 
-        _ = ctx.TryWriteUInt64(condAddress, syntheticHandle);
+        if (!ctx.TryWriteUInt64(condAddress, handle))
+        {
+            lock (_stateGate)
+            {
+                _condStates.Remove(condAddress);
+                _condStates.Remove(handle);
+            }
+
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1047,7 +1143,19 @@ public static class KernelPthreadCompatExports
             Type = type,
         };
 
-        var syntheticHandle = AllocateSyntheticHandle(SyntheticMutexHandleBase, ref _nextSyntheticMutexHandleId);
+        if (!TryAllocateOpaqueObject(ctx, MutexObjectSize, out var handle))
+        {
+            resolvedAddress = 0;
+            state = null;
+            return false;
+        }
+        if (!InitializeMutexObject(ctx, handle, createdState))
+        {
+            resolvedAddress = 0;
+            state = null;
+            return false;
+        }
+
         lock (_stateGate)
         {
             if (_mutexStates.TryGetValue(mutexAddress, out state))
@@ -1056,18 +1164,30 @@ public static class KernelPthreadCompatExports
                 return true;
             }
 
-            if (_mutexStates.TryGetValue(syntheticHandle, out state))
+            if (_mutexStates.TryGetValue(handle, out state))
             {
-                resolvedAddress = syntheticHandle;
+                resolvedAddress = handle;
                 return true;
             }
 
             _mutexStates[mutexAddress] = createdState;
-            _mutexStates[syntheticHandle] = createdState;
+            _mutexStates[handle] = createdState;
         }
 
-        _ = ctx.TryWriteUInt64(mutexAddress, syntheticHandle);
-        resolvedAddress = syntheticHandle;
+        if (!ctx.TryWriteUInt64(mutexAddress, handle))
+        {
+            lock (_stateGate)
+            {
+                _mutexStates.Remove(mutexAddress);
+                _mutexStates.Remove(handle);
+            }
+
+            resolvedAddress = 0;
+            state = null;
+            return false;
+        }
+
+        resolvedAddress = handle;
         state = createdState;
         return true;
     }
