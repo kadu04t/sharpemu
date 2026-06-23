@@ -34,6 +34,8 @@ public static class AgcExports
     private const uint SpiShaderPgmHiPs = 0x9;
     private const uint SpiShaderPgmLoEs = 0xC8;
     private const uint SpiShaderPgmHiEs = 0xC9;
+    private const uint SpiShaderPgmLoLs = 0x148;
+    private const uint SpiShaderPgmHiLs = 0x149;
     private const uint SpiPsInputEna = 0x1B3;
     private const uint SpiPsInputAddr = 0x1B4;
     private const uint ComputePgmLo = 0x20C;
@@ -345,7 +347,7 @@ public static class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!TryReadByte(ctx, geometryShaderAddress + ShaderTypeOffset, out var shaderType) || shaderType != 2 ||
+        if (!TryReadByte(ctx, geometryShaderAddress + ShaderTypeOffset, out var shaderType) || !IsEsGeometryShaderType(shaderType) ||
             !TryReadUInt64(ctx, geometryShaderAddress + ShaderSpecialsOffset, out var specialsAddress) ||
             specialsAddress == 0)
         {
@@ -362,7 +364,7 @@ public static class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        TraceAgc($"agc.create_prim_state cx=0x{cxRegistersAddress:X16} uc=0x{ucRegistersAddress:X16} gs=0x{geometryShaderAddress:X16} prim=0x{primitiveType:X8}");
+        TraceAgc($"agc.create_prim_state cx=0x{cxRegistersAddress:X16} uc=0x{ucRegistersAddress:X16} gs=0x{geometryShaderAddress:X16} type={shaderType} prim=0x{primitiveType:X8}");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1322,14 +1324,16 @@ public static class AgcExports
         {
             0 => ComputePgmLo,
             1 => SpiShaderPgmLoPs,
-            2 => SpiShaderPgmLoEs,
+            2 or 6 => SpiShaderPgmLoEs,
+            7 => SpiShaderPgmLoLs,
             _ => 0u,
         };
         var expectedHi = shaderType switch
         {
             0 => ComputePgmHi,
             1 => SpiShaderPgmHiPs,
-            2 => SpiShaderPgmHiEs,
+            2 or 6 => SpiShaderPgmHiEs,
+            7 => SpiShaderPgmHiLs,
             _ => 0u,
         };
         if (expectedLo == 0 || loRegister != expectedLo || hiRegister != expectedHi)
@@ -1343,6 +1347,9 @@ public static class AgcExports
         return TryWriteUInt32(ctx, shRegistersAddress + sizeof(uint), loValue) &&
                TryWriteUInt32(ctx, shRegistersAddress + 8 + sizeof(uint), hiValue);
     }
+
+    private static bool IsEsGeometryShaderType(byte shaderType) =>
+        shaderType is 2 or 6;
 
     private static int SetIndirectPatchAddress(CpuContext ctx, string registerSpace)
     {
