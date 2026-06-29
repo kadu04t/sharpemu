@@ -268,6 +268,8 @@ internal static unsafe class VulkanVideoPresenter
             options.Title = VideoOutExports.GetWindowTitle();
             options.WindowBorder = WindowBorder.Fixed;
             options.VSync = true;
+            options.FramesPerSecond = 60;
+            options.UpdatesPerSecond = 60;
             _window = Window.Create(options);
             _window.Load += Initialize;
             _window.Render += Render;
