@@ -16,7 +16,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <RuntimeIdentifiers>win-x64;linux-x64;osx-arm64</RuntimeIdentifiers>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract> -->
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -28,6 +28,11 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' Or '$(RuntimeIdentifier)' == ''">
+    <ApplicationIcon>..\..\assets\images\SharpEmu.ico</ApplicationIcon>
+    <Win32Icon>..\..\assets\images\SharpEmu.ico</Win32Icon>
   </PropertyGroup>
 
   <ItemGroup>

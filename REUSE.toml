@@ -9,6 +9,7 @@ path = [
     "src/SharpEmu.HLE/Aerolib/aerolib.bin",
     "_logs/**",
     ".github/images/**"
+    "assets/images/**"
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "SharpEmu Emulator Project"
