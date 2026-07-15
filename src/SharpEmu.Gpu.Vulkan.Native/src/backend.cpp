@@ -775,7 +775,13 @@ se_gpu_result SE_GPU_CALL se_gpu_input_snapshot(se_gpu_backend* b, se_gpu_input*
     if (state->left_trigger > 64) state->gamepad_buttons |= 1u << 10;
     if (state->right_trigger > 64) state->gamepad_buttons |= 1u << 11;
     const char* name = SDL_GetGamepadName(b->gamepad);
-    if (name) SDL_strlcpy(state->gamepad_name_utf8, name, sizeof(state->gamepad_name_utf8));
+    if (name) {
+#if defined(_WIN32)
+        strncpy_s(state->gamepad_name_utf8, sizeof(state->gamepad_name_utf8), name, _TRUNCATE);
+#else
+        SDL_strlcpy(state->gamepad_name_utf8, name, sizeof(state->gamepad_name_utf8));
+#endif
+    }
     return SE_GPU_OK;
 }
 se_gpu_result SE_GPU_CALL se_gpu_present_bgra(
