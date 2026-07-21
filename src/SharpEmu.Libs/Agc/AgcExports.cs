@@ -549,6 +549,7 @@ public static partial class AgcExports
         public bool HasActiveSubmission { get; set; }
         public bool IsSuspended { get; set; }
         public ulong CompletionEventNotifiedSubmissionId { get; set; }
+        public ulong CompletionInterruptSubmissionId { get; set; }
         public Dictionary<(uint Op, uint Register), uint> FramePacketCounts { get; } = new();
         public uint FramePacketCount { get; set; }
         public uint FrameDrawCount { get; set; }
@@ -2646,6 +2647,32 @@ public static partial class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "Zw7uUVPulbw",
+        ExportName = "sceAgcDriverGetEqContextId",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverGetEqContextId(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0 ||
+            !TryReadUInt64(ctx, eventAddress + 0x10, out var eventData))
+        {
+            // This API returns the id directly rather than an Orbis status.
+            // Zero is the only safe value for a malformed event and is also a
+            // valid initial context id.
+            ctx[CpuRegister.Rax] = 0;
+            TraceAgc($"agc.driver_get_eq_context_id event=0x{eventAddress:X16} unreadable");
+            return 0;
+        }
+
+        var contextId = (uint)eventData;
+        ctx[CpuRegister.Rax] = contextId;
+        TraceAgc(
+            $"agc.driver_get_eq_context_id event=0x{eventAddress:X16} context={contextId}");
+        return unchecked((int)contextId);
+    }
+
+    [SysAbiExport(
         Nid = "DL2RXaXOy88",
         ExportName = "sceAgcDriverDeleteEqEvent",
         Target = Generation.Gen5,
@@ -2955,6 +2982,14 @@ public static partial class AgcExports
         }
 
         state.CompletionEventNotifiedSubmissionId = submissionId;
+        if (state.CompletionInterruptSubmissionId == submissionId)
+        {
+            TraceAgc(
+                $"agc.driver_submit_dcb completion submission={submissionId} " +
+                "source=release_mem_interrupt");
+            return;
+        }
+
         void TriggerCompletionEvents()
         {
             var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
@@ -2975,6 +3010,9 @@ public static partial class AgcExports
         // guest-memory writes have finished. Put the notification on that same
         // logical graphics queue instead of approximating completion with a
         // timer, which can wake Unity while its upload data is still stale.
+        using var guestQueueScope = GuestGpu.Current.EnterGuestQueue(
+            state.QueueName,
+            submissionId);
         if (GuestGpu.Current.SubmitOrderedGuestAction(
                 TriggerCompletionEvents,
                 $"agc submit completion {submissionId}") == 0)
@@ -3148,22 +3186,14 @@ public static partial class AgcExports
                 TryReadUInt32(ctx, currentAddress + sizeof(uint), out var eventTypeRaw))
             {
                 var eventType = eventTypeRaw & 0x3Fu;
-                SubmitOrderedGpuSideEffect(
-                    ctx,
-                    gpuState,
-                    state,
-                    () =>
-                    {
-                        var triggered = KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
-                            KernelEventQueueCompatExports.KernelEventFilterGraphics,
-                            eventType);
-                        if (tracePackets)
-                        {
-                            TraceAgc($"agc.dcb.event type=0x{eventType:X2} queues={triggered}");
-                        }
-                    },
-                    $"event_write type=0x{eventType:X2}",
-                    currentAddress);
+                // IT_EVENT_WRITE selects a hardware pipeline/cache event. It
+                // is not an OS event-queue interrupt and carries no AGC context
+                // id. Driver completion is emitted by RReleaseMem below when
+                // its interrupt field is nonzero.
+                if (tracePackets)
+                {
+                    TraceAgc($"agc.dcb.event type=0x{eventType:X2}");
+                }
             }
 
             if (op == ItNop && register == RReleaseMem && length >= 7)
@@ -5236,12 +5266,14 @@ public static partial class AgcExports
             !TryReadUInt32(ctx, packetAddress + 12, out var destinationLo) ||
             !TryReadUInt32(ctx, packetAddress + 16, out var destinationHi) ||
             !TryReadUInt32(ctx, packetAddress + 20, out var dataLo) ||
-            !TryReadUInt32(ctx, packetAddress + 24, out var dataHi))
+            !TryReadUInt32(ctx, packetAddress + 24, out var dataHi) ||
+            !TryReadUInt32(ctx, packetAddress + 28, out var interruptContextId))
         {
             return;
         }
 
         var dataSelection = (control >> 16) & 0xFFu;
+        var interrupt = control >> 24;
         var destinationAddress = ((ulong)destinationHi << 32) | destinationLo;
         var data = ((ulong)dataHi << 32) | dataLo;
         var writeLength = dataSelection switch
@@ -5250,6 +5282,11 @@ public static partial class AgcExports
             2 or 3 => (ulong)sizeof(ulong),
             _ => 0UL,
         };
+        if (interrupt != 0)
+        {
+            state.CompletionInterruptSubmissionId = state.ActiveSubmissionId;
+        }
+
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
@@ -5280,11 +5317,18 @@ public static partial class AgcExports
                         ctx.Memory, destinationAddress, dataSelection == 1 ? dataLo : data);
                 }
 
+                var triggered = interrupt == 0
+                    ? 0
+                    : KernelEventQueueCompatExports.TriggerRegisteredEventsByFilterUncoalesced(
+                        KernelEventQueueCompatExports.KernelEventFilterGraphics,
+                        interruptContextId);
+
                 if (tracePacket)
                 {
                     TraceAgc(
                         $"agc.dcb.release_mem dst=0x{destinationAddress:X16} " +
-                        $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData}");
+                        $"data_sel={dataSelection} data=0x{data:X16} wrote={wroteData} " +
+                        $"interrupt={interrupt} context={interruptContextId} queues={triggered}");
                 }
             },
             $"release_mem dst=0x{destinationAddress:X16} data=0x{data:X16}",

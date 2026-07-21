@@ -1923,6 +1923,19 @@ public static partial class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "VAzswvTOCzI",
+        ExportName = "unlink",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int PosixUnlink(CpuContext ctx)
+    {
+        var result = KernelUnlink(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : PosixFailure(ctx, result);
+    }
+
+    [SysAbiExport(
         Nid = "1-LFLmRFxxM",
         ExportName = "sceKernelMkdir",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -2865,21 +2878,28 @@ public static partial class KernelMemoryCompatExports
         var length = ctx[CpuRegister.Rsi];
         if (!IsAligned(start, OrbisPageSize) || !IsAligned(length, OrbisPageSize))
         {
+            TraceDirectMemoryRelease(ctx, "release_direct", start, length, released: false,
+                OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
         if (length == 0)
         {
+            TraceDirectMemoryRelease(ctx, "release_direct", start, length, released: true,
+                OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        bool released;
         lock (_memoryGate)
         {
             // The unchecked API ignores an unallocated range, matching the
             // kernel contract used by guest pool allocators during teardown.
-            _ = TryReleaseDirectMemoryRangeLocked(start, length);
+            released = TryReleaseDirectMemoryRangeLocked(start, length);
         }
 
+        TraceDirectMemoryRelease(ctx, "release_direct", start, length, released,
+            OrbisGen2Result.ORBIS_GEN2_OK);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -2895,22 +2915,33 @@ public static partial class KernelMemoryCompatExports
 
         if (!IsAligned(start, OrbisPageSize) || !IsAligned(length, OrbisPageSize))
         {
+            TraceDirectMemoryRelease(ctx, "checked_release_direct", start, length, released: false,
+                OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
         if (length == 0)
         {
+            TraceDirectMemoryRelease(ctx, "checked_release_direct", start, length, released: true,
+                OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        bool released;
         lock (_memoryGate)
         {
-            if (!TryReleaseDirectMemoryRangeLocked(start, length))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
-            }
+            released = TryReleaseDirectMemoryRangeLocked(start, length);
         }
 
+        if (!released)
+        {
+            TraceDirectMemoryRelease(ctx, "checked_release_direct", start, length, released: false,
+                OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        TraceDirectMemoryRelease(ctx, "checked_release_direct", start, length, released: true,
+            OrbisGen2Result.ORBIS_GEN2_OK);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -6068,6 +6099,41 @@ public static partial class KernelMemoryCompatExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_DIRECT_MEMORY"), "1", StringComparison.Ordinal);
 
     private static bool ShouldTraceDirectMemory() => _traceDirectMemory;
+
+    private static void TraceDirectMemoryRelease(
+        CpuContext ctx,
+        string operation,
+        ulong start,
+        ulong length,
+        bool released,
+        OrbisGen2Result result)
+    {
+        if (!ShouldTraceDirectMemory())
+        {
+            return;
+        }
+
+        var returnRip = 0UL;
+        var stackPointer = ctx[CpuRegister.Rsp];
+        if (stackPointer != 0)
+        {
+            _ = ctx.TryReadUInt64(stackPointer, out returnRip);
+        }
+
+        string allocations;
+        lock (_memoryGate)
+        {
+            allocations = string.Join(
+                ",",
+                _directAllocations.Values
+                    .OrderBy(static allocation => allocation.Start)
+                    .Select(static allocation =>
+                        $"0x{allocation.Start:X}-0x{allocation.Start + allocation.Length:X}"));
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] {operation}: ret=0x{returnRip:X16} start=0x{start:X16} len=0x{length:X16} released={released} result={result} remaining=[{allocations}]");
+    }
 
     private static bool TryReleaseDirectMemoryRangeLocked(ulong start, ulong length)
     {

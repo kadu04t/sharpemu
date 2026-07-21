@@ -23,6 +23,7 @@ public static class KernelPthreadCompatExports
     private const int PthreadOnceUninitialized = 0;
     private const int PthreadOnceInProgress = 1;
     private const int PthreadOnceDone = 2;
+    private static readonly TimeSpan HostMutexExceptionPollInterval = TimeSpan.FromMilliseconds(2);
 
     private static readonly object _stateGate = new();
     private static readonly ConcurrentDictionary<ulong, PthreadMutexState> _mutexStates = new();
@@ -35,6 +36,10 @@ public static class KernelPthreadCompatExports
     private static readonly bool _tracePthreadConds =
         _tracePthreads ||
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_CONDS"), "1", StringComparison.Ordinal);
+    private static readonly bool _tracePthreadTrylocks =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_TRYLOCKS"), "1", StringComparison.Ordinal);
+    private static readonly HashSet<ulong>? _forceMutexHostWaitHandles = ParseTraceAddressFilter(
+        Environment.GetEnvironmentVariable("SHARPEMU_EXPERIMENT_PTHREAD_MUTEX_HOST_WAIT_HANDLE"));
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
     private static long _nextSynchronizationWaiterId;
@@ -807,7 +812,12 @@ public static class KernelPthreadCompatExports
             return ownedResult;
         }
 
-        var canCooperativelyBlock = !tryOnly &&
+        var forceHostWait = _forceMutexHostWaitHandles is { Count: > 0 } &&
+            (_forceMutexHostWaitHandles.Contains(mutexAddress) ||
+             _forceMutexHostWaitHandles.Contains(resolvedAddress) ||
+             (KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress, out var guestMutexHandle) &&
+              _forceMutexHostWaitHandles.Contains(guestMutexHandle)));
+        var canCooperativelyBlock = !forceHostWait && !tryOnly &&
             GuestThreadExecution.IsGuestThread &&
             GuestThreadExecution.TryGetCurrentImportCallFrame(out _);
         PthreadMutexWaiter? waiter = null;
@@ -918,7 +928,7 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        var hostResult = WaitForHostMutexLock(state, waiter!);
+        var hostResult = WaitForHostMutexLock(ctx, state, waiter!);
         TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, hostResult);
         return hostResult;
     }
@@ -1566,7 +1576,7 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        _ = WaitForHostMutexLock(mutexState, waiter.MutexWaiter);
+        _ = WaitForHostMutexLock(ctx, mutexState, waiter.MutexWaiter);
         var waitResult = waiter.CompletionState == 2
             ? CondTimedOutResult(waiter)
             : (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -1751,7 +1761,10 @@ public static class KernelPthreadCompatExports
         }
     }
 
-    private static int WaitForHostMutexLock(PthreadMutexState state, PthreadMutexWaiter waiter)
+    private static int WaitForHostMutexLock(
+        CpuContext ctx,
+        PthreadMutexState state,
+        PthreadMutexWaiter waiter)
     {
         ManualResetEventSlim? hostSignal = null;
         try
@@ -1775,7 +1788,16 @@ public static class KernelPthreadCompatExports
                     hostSignal.Reset();
                 }
 
-                hostSignal.Wait();
+                if (!hostSignal.Wait(HostMutexExceptionPollInterval))
+                {
+                    // Primary/external guest execution cannot use the cooperative
+                    // scheduler continuation path. Keep the mutex wait intact, but
+                    // let its backend run a queued signal/exception handler on this
+                    // exact executor before resuming the wait. Unity's stop-the-world
+                    // collector relies on this thread to acknowledge suspension.
+                    GuestThreadExecution.Scheduler?
+                        .ServicePendingGuestExceptionAtBlockingImport(ctx);
+                }
             }
         }
         finally
@@ -2091,7 +2113,8 @@ public static class KernelPthreadCompatExports
 
     private static void TracePthreadMutex(CpuContext ctx, string operation, ulong mutexAddress, ulong resolvedAddress, PthreadMutexState? state, ulong currentThreadId, int result)
     {
-        if (!ShouldTracePthreadMutex(mutexAddress, resolvedAddress))
+        if (!(_tracePthreadTrylocks && operation.StartsWith("trylock", StringComparison.Ordinal)) &&
+            !ShouldTracePthreadMutex(mutexAddress, resolvedAddress))
         {
             return;
         }

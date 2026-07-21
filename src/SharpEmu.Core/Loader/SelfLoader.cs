@@ -1108,6 +1108,19 @@ public sealed class SelfLoader : ISelfLoader
                 continue;
             }
 
+            if (string.Equals(nid, "Zw7uUVPulbw", StringComparison.Ordinal) &&
+                string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_EQ_CONTEXT"),
+                    "1",
+                    StringComparison.Ordinal))
+            {
+                // The runtime import map currently retains only the NID. Keep the
+                // original linker symbol visible so its library/module identifiers
+                // can be decoded without guessing an HLE export signature.
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.eq_context raw_import_symbol={symbolName}");
+            }
+
             if (seenImportNids.Add(nid))
             {
                 orderedImportNids.Add(nid);

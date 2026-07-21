@@ -19,6 +19,10 @@ public static class KernelPthreadExtendedCompatExports
     private const ulong DefaultStackSize = 0x1_00000UL;
     private const ulong NativeGuestStackSize = 0x20_0000UL;
     private const ulong NativeGuestStackStride = 0x100_0000UL;
+    // Keep this in sync with DirectExecutionBackend.GuestThreadRegionSlots.
+    // IL2CPP asks pthread_attr_get_np for the live stack after the executor has
+    // mapped it; excluding later slots makes Boehm omit those threads' roots.
+    private const int NativeGuestStackRegionSlots = 1024;
     private const int DefaultInheritSched = 4;
     private const int DefaultSchedPolicy = 1;
     private const int DefaultSchedPriority = DefaultThreadPriority;
@@ -578,7 +582,11 @@ public static class KernelPthreadExtendedCompatExports
 		var highestStack = OperatingSystem.IsWindows()
 			? 0x00007FFF_F000_0000UL
 			: 0x00006FFF_F000_0000UL;
-		var lowestStack = highestStack - (63 * NativeGuestStackStride);
+		var guestThreadStackBase = OperatingSystem.IsWindows()
+			? 0x00007FFF_E000_0000UL
+			: 0x00006FFF_E000_0000UL;
+		var lowestStack = guestThreadStackBase -
+			((NativeGuestStackRegionSlots - 1UL) * NativeGuestStackStride);
 		if (candidate < lowestStack || candidate > highestStack)
 		{
 			return false;

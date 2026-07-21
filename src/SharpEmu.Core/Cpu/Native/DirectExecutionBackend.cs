@@ -822,6 +822,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static int _vectoredHandlerDepth;
 
 	private static int _nestedVehTraceCount;
+	private static int _guestExceptionHandlerDisasmCount;
+	private static int _guestExceptionCallbackDisasmCount;
 
 	private const uint MEM_COMMIT = 4096u;
 
@@ -1694,6 +1696,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_LLE_LIBC"), "1", StringComparison.Ordinal))
 		{
+			return false;
+		}
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_EXPERIMENT_HLE_LIBC_MEMORY"),
+				"1",
+				StringComparison.Ordinal) &&
+			exportName is "memcpy" or "memmove" or "memset" or "memcmp")
+		{
+			// Keep the title-compatible LLE allocator family while A/B testing the
+			// bulk memory routines independently. This isolates corruption caused by
+			// an LLE copy/fill path without changing allocation ownership or layout.
 			return false;
 		}
 		var value = Environment.GetEnvironmentVariable("SHARPEMU_LLE_LIBC_SAFE_ONLY");
@@ -3106,6 +3119,52 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	public void ServicePendingGuestExceptionAtBlockingImport(CpuContext callerContext)
+	{
+		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return;
+		}
+
+		var threadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
+		if (threadHandle == 0)
+		{
+			threadHandle = _currentExternalGuestThreadHandle;
+		}
+
+		int exceptionType;
+		lock (_guestThreadGate)
+		{
+			if (threadHandle == 0 ||
+				_activeGuestExceptionDeliveries.Contains(threadHandle) ||
+				!_pendingGuestExceptions.TryGetValue(threadHandle, out var pending))
+			{
+				return;
+			}
+
+			exceptionType = pending.ExceptionType;
+		}
+
+		if (!GuestThreadExecution.TryCaptureCurrentImportContinuation(
+				callerContext,
+				out var interruptedContinuation))
+		{
+			return;
+		}
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_EXCEPTIONS"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] guest_exception.blocking_import_safe_point " +
+				$"target=0x{threadHandle:X16} type=0x{exceptionType:X2} " +
+				$"rip=0x{interruptedContinuation.Rip:X16}");
+		}
+
+		DeliverPendingGuestExceptionAtSafePoint(callerContext, interruptedContinuation);
+	}
+
 	public bool TryJoinThread(
 		CpuContext callerContext,
 		ulong threadHandle,
@@ -4004,7 +4063,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			exceptionStackBase = target.ExceptionStackBase;
 
-			if (target.State != GuestThreadRunState.Blocked || target.ExecutorActive)
+			if (target.ExecutorActive)
 			{
 				if (_pendingGuestExceptions.ContainsKey(threadHandle) ||
 					_activeGuestExceptionDeliveries.Contains(threadHandle))
@@ -4034,8 +4093,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return true;
 			}
 
-			// A parked cooperative thread has no active executor, so its saved
-			// continuation can be handled immediately on a temporary executor.
+			// A cooperative thread without an active executor can run the handler
+			// immediately on its persistent executor. This includes Ready threads:
+			// queueing until their next import boundary makes signal delivery
+			// reentrant inside the newly-started native slice and can strand the
+			// handler before its stop-the-world acknowledgement.
 			if (target.ExceptionDeliveryActive)
 			{
 				return true;
@@ -4050,7 +4112,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			savedBlockWaiter = target.BlockWaiter;
 			savedBlockDeadlineTimestamp = target.BlockDeadlineTimestamp;
 
-			target.State = GuestThreadRunState.Running;
+			// Keep a Ready target visibly Ready while reserving ExecutorActive.
+			// Its existing ready-queue entry will then be deferred instead of being
+			// discarded by TryClaimReadyGuestThreadLocked during delivery.
+			target.State = savedState == GuestThreadRunState.Ready
+				? GuestThreadRunState.Ready
+				: GuestThreadRunState.Running;
 			target.ExecutorActive = true;
 			target.ExceptionDeliveryActive = true;
 			target.BlockReason = null;
@@ -4069,6 +4136,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		if (handler >= 0x210)
 		{
 			_ = target.Context.TryReadUInt64(handler - 0x210 + 0xC020, out guestExceptionCallback);
+		}
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_EXCEPTION_DISASM"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			if (Interlocked.CompareExchange(ref _guestExceptionHandlerDisasmCount, 1, 0) == 0)
+			{
+				DumpGuestInstructionStream("guest-exception-handler", handler, 128);
+			}
+			if (guestExceptionCallback >= 0x10000 &&
+				Interlocked.CompareExchange(ref _guestExceptionCallbackDisasmCount, 1, 0) == 0)
+			{
+				DumpGuestInstructionStream("guest-exception-callback", guestExceptionCallback, 128);
+			}
 		}
 		if (!TryWriteGuestExceptionContext(
 				target.Context,
@@ -4238,7 +4320,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		// Unity's suspend callback uses a 256-bucket table at this fixed
 		// image-relative offset from the callback entry. Each node stores the
 		// pthread handle at +0x08 and the next pointer at +0x00.
-		var tableAddress = callback + 0x102E8B0;
+		// Il2cppUserAssemblies.prx: callback RVA 0x26CDE0 addresses the
+		// registered-thread bucket table at RVA 0x3580F30.
+		var tableAddress = callback + 0x3314150;
 		for (var bucket = 0; bucket < 256; bucket++)
 		{
 			if (!context.TryReadUInt64(tableAddress + unchecked((ulong)bucket * 8), out var node))
