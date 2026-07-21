@@ -66,8 +66,15 @@ public static class KernelRuntimeCompatExports
     private static readonly (ulong Base, ulong Size)[] _prtApertures = new (ulong Base, ulong Size)[3];
     private static int _stackChkFailCount;
     private static long _usleepTraceCount;
+    private static int _utcToLocalTraceCount;
+    private static int _localToUtcTraceCount;
     private static readonly bool _traceUsleep =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal);
+    private static readonly bool _traceKernelTimeConversion =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_KERNEL_TIME_CONVERSION"),
+            "1",
+            StringComparison.Ordinal);
     private static readonly bool _traceGuestThreads =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_THREADS"), "1", StringComparison.Ordinal);
 
@@ -1015,6 +1022,18 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // The sysmodule spelling is ABI-compatible with the libKernel entry point.
+    // Unity and native plug-ins use it while walking stacks from dynamically
+    // loaded PRX modules, so returning the generic unresolved sentinel prevents
+    // the unwinder from discovering the registered module's EH-frame range.
+    [SysAbiExport(
+        Nid = "4fU5yvOkVG4",
+        ExportName = "sceSysmoduleGetModuleInfoForUnwind",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx) =>
+        KernelGetModuleInfoForUnwind(ctx);
+
     [SysAbiExport(
         Nid = "kUpgrXIrz7Q",
         ExportName = "sceKernelGetModuleInfo",
@@ -1339,24 +1358,46 @@ public static class KernelRuntimeCompatExports
         var localTimeAddress = ctx[CpuRegister.Rsi];
         var timesecAddress = ctx[CpuRegister.Rdx];
         var dstSecondsAddress = ctx[CpuRegister.Rcx];
+        var traceIndex = _traceKernelTimeConversion
+            ? Interlocked.Increment(ref _utcToLocalTraceCount)
+            : 0;
+        if (traceIndex is > 0 and <= 16)
+        {
+            _ = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame);
+            Console.Error.WriteLine(
+                $"[KERNEL][TRACE] utc_to_local#{traceIndex} " +
+                $"utc={utcSeconds} local_out=0x{localTimeAddress:X16} " +
+                $"timesec_out=0x{timesecAddress:X16} dst_out=0x{dstSecondsAddress:X16} " +
+                $"ret=0x{frame.ReturnRip:X16}");
+        }
 
         if (localTimeAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var utc = DateTimeOffset.FromUnixTimeSeconds(utcSeconds);
+        DateTimeOffset utc;
+        try
+        {
+            utc = DateTimeOffset.FromUnixTimeSeconds(utcSeconds);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
         var local = TimeZoneInfo.ConvertTime(utc, TimeZoneInfo.Local);
         var offset = local.Offset;
-        var localSeconds = utcSeconds + (long)offset.TotalSeconds;
-        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(local.DateTime)
-            ? (uint)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
+        var daylightSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(local.DateTime)
+            ? (int)TimeZoneInfo.Local.GetAdjustmentRules()
                 .Where(rule => rule.DateStart <= local.Date && rule.DateEnd >= local.Date)
                 .Select(rule => rule.DaylightDelta.TotalSeconds)
                 .DefaultIfEmpty(0)
-                .Max())
-            : 0u;
-        var westSeconds = unchecked((uint)(int)offset.TotalSeconds);
+                .First()
+            : 0;
+        var standardOffsetSeconds = (long)offset.TotalSeconds - daylightSeconds;
+        var localSeconds = utcSeconds + standardOffsetSeconds + daylightSeconds;
+        var dstSeconds = unchecked((uint)daylightSeconds);
+        var westSeconds = unchecked((uint)(int)standardOffsetSeconds);
 
         if (!ctx.TryWriteUInt64(localTimeAddress, unchecked((ulong)localSeconds)))
         {
@@ -1380,6 +1421,14 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        if (traceIndex is > 0 and <= 16)
+        {
+            Console.Error.WriteLine(
+                $"[KERNEL][TRACE] utc_to_local#{traceIndex}.result " +
+                $"local={localSeconds} west_seconds={standardOffsetSeconds} " +
+                $"dst_seconds={daylightSeconds}");
+        }
+
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1392,29 +1441,70 @@ public static class KernelRuntimeCompatExports
     public static int KernelConvertLocaltimeToUtc(CpuContext ctx)
     {
         var localSeconds = unchecked((long)ctx[CpuRegister.Rdi]);
+        var control = unchecked((long)ctx[CpuRegister.Rsi]);
         var utcTimeAddress = ctx[CpuRegister.Rdx];
-        var timezoneAddress = ctx[CpuRegister.Rcx];
+        var timesecAddress = ctx[CpuRegister.Rcx];
         var dstSecondsAddress = ctx[CpuRegister.R8];
+        var traceIndex = _traceKernelTimeConversion
+            ? Interlocked.Increment(ref _localToUtcTraceCount)
+            : 0;
+        if (traceIndex is > 0 and <= 16)
+        {
+            _ = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame);
+            Console.Error.WriteLine(
+                $"[KERNEL][TRACE] local_to_utc#{traceIndex} " +
+                $"local={localSeconds} control={control} utc_out=0x{utcTimeAddress:X16} " +
+                $"timesec_out=0x{timesecAddress:X16} dst_out=0x{dstSecondsAddress:X16} " +
+                $"ret=0x{frame.ReturnRip:X16}");
+        }
 
-        if (timezoneAddress == 0)
+        if (timesecAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var localDate = DateTimeOffset.FromUnixTimeSeconds(localSeconds).DateTime;
-        var offset = TimeZoneInfo.Local.GetUtcOffset(localDate);
-        var utcSeconds = localSeconds - (long)offset.TotalSeconds;
-        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(localDate)
-            ? (int)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
-                .Where(rule => rule.DateStart <= localDate.Date && rule.DateEnd >= localDate.Date)
-                .Select(rule => rule.DaylightDelta.TotalSeconds)
-                .DefaultIfEmpty(0)
-                .Max())
+        DateTime localDate;
+        try
+        {
+            localDate = DateTimeOffset.FromUnixTimeSeconds(localSeconds).DateTime;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+        var automaticOffset = TimeZoneInfo.Local.GetUtcOffset(localDate);
+        var ruleDaylightSeconds = (int)TimeZoneInfo.Local.GetAdjustmentRules()
+            .Where(rule => rule.DateStart <= localDate.Date && rule.DateEnd >= localDate.Date)
+            .Select(rule => rule.DaylightDelta.TotalSeconds)
+            .DefaultIfEmpty(0)
+            .First();
+        var automaticDaylightSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(localDate)
+            ? ruleDaylightSeconds
             : 0;
-        var minutesWest = unchecked((int)-offset.TotalMinutes);
+        var standardOffsetSeconds = (long)automaticOffset.TotalSeconds - automaticDaylightSeconds;
+        var dstSeconds = control switch
+        {
+            > 0 => ruleDaylightSeconds,
+            0 => 0,
+            _ => automaticDaylightSeconds,
+        };
+        var utcSeconds = localSeconds - standardOffsetSeconds - dstSeconds;
+        var westSeconds = unchecked((uint)(int)standardOffsetSeconds);
 
-        if (!TryWriteInt32(ctx, timezoneAddress, minutesWest) ||
-            !TryWriteInt32(ctx, timezoneAddress + sizeof(int), dstSeconds / 60))
+        // Despite older public prototypes naming this output "timezone", the
+        // platform libc passes a 16-byte OrbisTimesec and reads west_sec at +8
+        // and dst_sec at +12. Writing the 8-byte POSIX timezone layout leaves
+        // those fields uninitialized and makes libc's transition search loop
+        // through the entire time range.
+        Span<byte> timesec = stackalloc byte[OrbisTimesecSize];
+        BinaryPrimitives.WriteInt64LittleEndian(timesec, utcSeconds);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            timesec.Slice(sizeof(long), sizeof(uint)),
+            westSeconds);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            timesec.Slice(sizeof(long) + sizeof(uint), sizeof(uint)),
+            unchecked((uint)dstSeconds));
+        if (!ctx.Memory.TryWrite(timesecAddress, timesec))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -1427,6 +1517,13 @@ public static class KernelRuntimeCompatExports
         if (dstSecondsAddress != 0 && !TryWriteInt32(ctx, dstSecondsAddress, dstSeconds))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (traceIndex is > 0 and <= 16)
+        {
+            Console.Error.WriteLine(
+                $"[KERNEL][TRACE] local_to_utc#{traceIndex}.result " +
+                $"utc={utcSeconds} west_seconds={unchecked((int)westSeconds)} dst_seconds={dstSeconds}");
         }
 
         ctx[CpuRegister.Rax] = 0;

@@ -650,6 +650,65 @@ public static class KernelEventQueueCompatExports
     }
 
     /// <summary>
+    /// Queues one independent event on every queue registered for
+    /// <paramref name="filter"/>. Unlike the ordinary filter trigger, this does
+    /// not coalesce events with the same ident/filter pair. AGC completion
+    /// interrupts carry a context id in <c>data</c>; coalescing two such events
+    /// would discard one context that the guest still has to recycle.
+    /// </summary>
+    public static int TriggerRegisteredEventsByFilterUncoalesced(
+        short filter,
+        ulong data)
+    {
+        List<ulong>? wakeHandles = null;
+        var triggeredCount = 0;
+        lock (_eventQueueGate)
+        {
+            foreach (var (handle, registrations) in _registeredEvents)
+            {
+                foreach (var registration in registrations.Values)
+                {
+                    if (registration.Filter != filter)
+                    {
+                        continue;
+                    }
+
+                    if (!_pendingEvents.TryGetValue(handle, out var queue))
+                    {
+                        queue = new KernelEventDeque();
+                        _pendingEvents[handle] = queue;
+                    }
+
+                    queue.AddLast(new KernelQueuedEvent(
+                        registration.Ident,
+                        registration.Filter,
+                        0,
+                        1,
+                        data,
+                        registration.UserData));
+                    (wakeHandles ??= []).Add(handle);
+                    triggeredCount++;
+
+                    // A graphics event queue has one driver completion stream.
+                    // Do not duplicate one interrupt merely because the queue
+                    // contains another registration using the same filter.
+                    break;
+                }
+            }
+        }
+
+        if (wakeHandles is not null)
+        {
+            foreach (var handle in wakeHandles)
+            {
+                WakeEventQueue(handle);
+            }
+        }
+
+        return triggeredCount;
+    }
+
+    /// <summary>
     /// Queues one event for every registration using <paramref name="filter"/>.
     /// Unlike <see cref="TriggerRegisteredEvents"/>, this preserves distinct
     /// event identifiers registered on the same queue. AGC driver completion

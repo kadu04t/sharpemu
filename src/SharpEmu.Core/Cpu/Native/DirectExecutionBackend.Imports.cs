@@ -32,11 +32,13 @@ public sealed partial class DirectExecutionBackend
 	private const int ImportSavedXmmOffset = -128;
 	private const int ImportVectorRegisterCount = 8;
 	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
+	private const string AgcDriverGetEqContextIdNid = "Zw7uUVPulbw";
 	private static long _canaryReturnRecoveries;
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 	private int _il2CppExceptionDiagnosticCount;
+	private int _agcEqContextDiagnosticCount;
 
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
@@ -48,6 +50,8 @@ public sealed partial class DirectExecutionBackend
 					$"[LOADER][ERROR] ImportDispatchGatewayManaged: invalid backend handle 0x{backendHandle:X16}");
 				return 18446744071562199042uL;
 			}
+
+			directExecutionBackend.EnsureNativeWriteWatchArmedForCurrentThread();
 
 			if (_perfHleHistogram)
 			{
@@ -205,6 +209,25 @@ public sealed partial class DirectExecutionBackend
 		ulong value7 = cpuContext[CpuRegister.R14];
 		ulong value8 = cpuContext[CpuRegister.R15];
 		ulong num7 = *(ulong*)(argPackPtr + 96);
+		var traceAgcEqContextArguments =
+			string.Equals(importStubEntry.Nid, AgcDriverGetEqContextIdNid, StringComparison.Ordinal) &&
+			string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_EQ_CONTEXT"),
+				"1",
+				StringComparison.Ordinal) &&
+			Interlocked.Increment(ref _agcEqContextDiagnosticCount) <= 8;
+		if (traceAgcEqContextArguments)
+		{
+			DumpUnresolvedImportArguments(
+				cpuContext,
+				"before",
+				value,
+				value2,
+				num3,
+				num4,
+				num5,
+				num6);
+		}
 		var importStackPointer = (ulong)argPackPtr + 96;
 		var probeTarget = (_probeImportReturnAddress != 0 && num7 == _probeImportReturnAddress) ||
 			(string.Equals(importStubEntry.Nid, "2Z+PpY6CaJg", StringComparison.Ordinal) &&
@@ -508,6 +531,27 @@ public sealed partial class DirectExecutionBackend
 				{
 					orbisGen2Result = DispatchIl2CppApiLookupSymbol();
 				}
+				else if (string.Equals(
+						importStubEntry.Nid,
+						AgcDriverGetEqContextIdNid,
+						StringComparison.Ordinal) &&
+					TryResolveExperimentalAgcEqContextId(
+						cpuContext,
+						value,
+						out var experimentalEqContextId,
+						out var experimentalEqContextSource))
+				{
+					// Diagnostic-only causal experiment. The Neva caller consumes EAX
+					// directly as an EQ context id; it does not test it as an error code.
+					// Do not turn this into an HLE export without recovering the real
+					// driver state and id-selection semantics.
+					cpuContext[CpuRegister.Rax] = (uint)experimentalEqContextId;
+					orbisGen2Result = OrbisGen2Result.ORBIS_GEN2_OK;
+					Console.Error.WriteLine(
+						$"[LOADER][EXPERIMENT] sceAgcDriverGetEqContextId " +
+						$"override={experimentalEqContextId} source={experimentalEqContextSource} " +
+						$"event=0x{value:X16}");
+				}
 				else if (importStubEntry.Export is { } cachedExport &&
 					(cachedExport.Target & cpuContext.TargetGeneration) != 0)
 				{
@@ -546,6 +590,18 @@ public sealed partial class DirectExecutionBackend
 			if (!dispatchResolved)
 			{
 				LastError = "Missing HLE export for NID: " + importStubEntry.Nid;
+				if (traceAgcEqContextArguments)
+				{
+					DumpUnresolvedImportArguments(
+						cpuContext,
+						"after-unresolved-fallback",
+						value,
+						value2,
+						num3,
+						num4,
+						num5,
+						num6);
+				}
 				if (string.Equals(importStubEntry.Nid, "cfwBSQyr5Ys", StringComparison.Ordinal) &&
 					string.Equals(
 						Environment.GetEnvironmentVariable("SHARPEMU_LOG_IL2CPP_EXCEPTION"),
@@ -556,7 +612,11 @@ public sealed partial class DirectExecutionBackend
 					DumpIl2CppExceptionDiagnostic(cpuContext, value, num7);
 				}
 				Console.Error.WriteLine(
-					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
+					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} " +
+					$"name={Aerolib.Instance.GetName(importStubEntry.Nid)} " +
+					$"library={(importStubEntry.Export?.LibraryName ?? "<not-retained>")} " +
+					$"module=<not-retained> target={cpuContext.TargetGeneration} " +
+					$"rax=0x{cpuContext[CpuRegister.Rax]:X16} return_rip=0x{num7:X16} " +
 					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
 				if (importStubEntry.Nid == "L-Q3LEjIbgA")
 				{
@@ -700,6 +760,79 @@ public sealed partial class DirectExecutionBackend
 				Volatile.Write(ref failedGuestThreadState.LastImportResultValid, 1);
 			}
 			return cpuContext[CpuRegister.Rax];
+		}
+	}
+
+	private static bool TryResolveExperimentalAgcEqContextId(
+		CpuContext cpuContext,
+		ulong eventAddress,
+		out int contextId,
+		out string source)
+	{
+		var configured = Environment.GetEnvironmentVariable(
+			"SHARPEMU_EXPERIMENT_AGC_EQ_CONTEXT_ID");
+		if (int.TryParse(configured, out contextId) && contextId is >= 0 and <= 7)
+		{
+			source = "constant";
+			return true;
+		}
+
+		// Graphics kevents are the only state available to the driver call. The
+		// low three fflags bits are therefore the strongest remaining candidate
+		// for the per-event EQ context id. Keep this behind the experiment switch
+		// until a title run demonstrates that varying it per event is meaningful.
+		if (string.Equals(configured, "event_fflags", StringComparison.OrdinalIgnoreCase) &&
+			eventAddress != 0 &&
+			cpuContext.TryReadUInt32(eventAddress + 0x0C, out var eventFflags))
+		{
+			contextId = (int)(eventFflags & 7);
+			source = $"event_fflags(0x{eventFflags:X8})";
+			return true;
+		}
+
+		contextId = 0;
+		source = "none";
+		return false;
+	}
+
+	private static void DumpUnresolvedImportArguments(
+		CpuContext cpuContext,
+		string phase,
+		ulong rdi,
+		ulong rsi,
+		ulong rdx,
+		ulong rcx,
+		ulong r8,
+		ulong r9)
+	{
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] agc.eq_context phase={phase} " +
+			$"rdi=0x{rdi:X16} rsi=0x{rsi:X16} rdx=0x{rdx:X16} " +
+			$"rcx=0x{rcx:X16} r8=0x{r8:X16} r9=0x{r9:X16}");
+
+		var arguments = new (string Name, ulong Address)[]
+		{
+			("rdi", rdi),
+			("rsi", rsi),
+			("rdx", rdx),
+			("rcx", rcx),
+			("r8", r8),
+			("r9", r9),
+		};
+		foreach (var (name, address) in arguments)
+		{
+			var bytes = new byte[32];
+			if (address < 0x10000 || !cpuContext.Memory.TryRead(address, bytes))
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] agc.eq_context.{phase}.{name} " +
+					$"addr=0x{address:X16} mapped=0");
+				continue;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] agc.eq_context.{phase}.{name} " +
+				$"addr=0x{address:X16} mapped=1 bytes={Convert.ToHexString(bytes)}");
 		}
 	}
 

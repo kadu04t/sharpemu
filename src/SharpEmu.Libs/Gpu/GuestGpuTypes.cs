@@ -27,7 +27,12 @@ internal sealed record GuestDrawTexture(
     uint Pitch = 0,
     uint TileMode = 0,
     uint DstSelect = 0xFAC,
-    GuestSampler Sampler = default);
+    GuestSampler Sampler = default,
+    // Guest CPU write-tracker generation of the memory RgbaPixels was read
+    // from; -1 when the range is untracked or the pixels were not read here.
+    long WriteGeneration = -1,
+    bool ArrayedView = false,
+    uint ArrayLayers = 1);
 
 /// <summary>Raw guest sampler descriptor dwords, copied verbatim from guest memory.</summary>
 internal readonly record struct GuestSampler(
@@ -48,7 +53,9 @@ internal readonly record struct TextureContentIdentity(
     uint DstSelect,
     uint TileMode,
     uint Pitch,
-    GuestSampler Sampler);
+    GuestSampler Sampler,
+    bool Arrayed = false,
+    uint ArrayLayers = 1);
 
 internal sealed record GuestMemoryBuffer(
     ulong BaseAddress,

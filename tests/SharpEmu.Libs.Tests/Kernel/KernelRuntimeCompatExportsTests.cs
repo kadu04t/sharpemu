@@ -1,7 +1,10 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers.Binary;
+using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
+using SharpEmu.Libs.Tests;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.Kernel;
@@ -11,6 +14,52 @@ namespace SharpEmu.Libs.Tests.Kernel;
 // otherwise falls back to the QPC-based Stopwatch, so the frequency selection has to follow suit.
 public sealed class KernelRuntimeCompatExportsTests
 {
+    [Fact]
+    public void TimeConversions_RoundTripAndWriteFullTimesecLayout()
+    {
+        const ulong memoryBase = 0x3_2000_0000;
+        const ulong localAddress = memoryBase + 0x100;
+        const ulong utcTimesecAddress = memoryBase + 0x110;
+        const ulong utcAddress = memoryBase + 0x130;
+        const ulong localTimesecAddress = memoryBase + 0x140;
+        const ulong dstAddress = memoryBase + 0x150;
+        const long originalUtcSeconds = 1_736_942_400; // 2025-01-15T12:00:00Z
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+
+        context[CpuRegister.Rdi] = unchecked((ulong)originalUtcSeconds);
+        context[CpuRegister.Rsi] = localAddress;
+        context[CpuRegister.Rdx] = utcTimesecAddress;
+        context[CpuRegister.Rcx] = 0;
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelConvertUtcToLocaltime(context));
+        Assert.True(context.TryReadUInt64(localAddress, out var localSeconds));
+
+        Span<byte> utcTimesec = stackalloc byte[16];
+        Assert.True(memory.TryRead(utcTimesecAddress, utcTimesec));
+        var expectedWestSeconds = BinaryPrimitives.ReadUInt32LittleEndian(utcTimesec[8..]);
+        var expectedDstSeconds = BinaryPrimitives.ReadUInt32LittleEndian(utcTimesec[12..]);
+
+        Span<byte> sentinel = stackalloc byte[16];
+        sentinel.Fill(0xA5);
+        Assert.True(memory.TryWrite(localTimesecAddress, sentinel));
+        context[CpuRegister.Rdi] = localSeconds;
+        context[CpuRegister.Rsi] = expectedDstSeconds == 0 ? 0UL : 1UL;
+        context[CpuRegister.Rdx] = utcAddress;
+        context[CpuRegister.Rcx] = localTimesecAddress;
+        context[CpuRegister.R8] = dstAddress;
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelConvertLocaltimeToUtc(context));
+        Assert.True(context.TryReadUInt64(utcAddress, out var roundTripUtcSeconds));
+        Assert.Equal(unchecked((ulong)originalUtcSeconds), roundTripUtcSeconds);
+
+        Span<byte> localTimesec = stackalloc byte[16];
+        Assert.True(memory.TryRead(localTimesecAddress, localTimesec));
+        Assert.Equal(originalUtcSeconds, BinaryPrimitives.ReadInt64LittleEndian(localTimesec));
+        Assert.Equal(expectedWestSeconds, BinaryPrimitives.ReadUInt32LittleEndian(localTimesec[8..]));
+        Assert.Equal(expectedDstSeconds, BinaryPrimitives.ReadUInt32LittleEndian(localTimesec[12..]));
+        Assert.True(context.TryReadUInt32(dstAddress, out var actualDstSeconds));
+        Assert.Equal(expectedDstSeconds, actualDstSeconds);
+    }
+
     private static KernelRuntimeCompatExports.TryGetFrequency Yields(ulong hz) =>
         (out ulong frequencyHz) =>
         {

@@ -49,6 +49,13 @@ public interface IGuestThreadScheduler
     /// </summary>
     void RegisterGuestThreadContext(ulong threadHandle, CpuContext context);
 
+    /// <summary>
+    /// Gives a host-blocked HLE import a safe point at which the current guest
+    /// executor can service a queued kernel exception. The implementation may
+    /// synchronously run the guest exception handler before returning.
+    /// </summary>
+    void ServicePendingGuestExceptionAtBlockingImport(CpuContext callerContext);
+
     bool TryStartThread(CpuContext creatorContext, GuestThreadStartRequest request, out string? error);
 
     bool TryJoinThread(
@@ -299,7 +306,7 @@ public static class GuestThreadExecution
         _pendingBlockWakeKey = string.IsNullOrWhiteSpace(wakeKey) ? _pendingBlockReason : wakeKey;
         _pendingBlockWaiter = waiter;
         _pendingBlockDeadlineTimestamp = blockDeadlineTimestamp;
-        if (context is not null && TryCaptureCurrentBlockContinuation(context, out var continuation))
+        if (context is not null && TryCaptureCurrentImportContinuation(context, out var continuation))
         {
             _pendingBlockContinuation = continuation;
             _pendingBlockContinuationValid = true;
@@ -417,7 +424,9 @@ public static class GuestThreadExecution
         return now + Math.Max(1, ticks);
     }
 
-    private static bool TryCaptureCurrentBlockContinuation(CpuContext context, out GuestCpuContinuation continuation)
+    public static bool TryCaptureCurrentImportContinuation(
+        CpuContext context,
+        out GuestCpuContinuation continuation)
     {
         if (!TryGetCurrentImportCallFrame(out var frame) ||
             frame.ReturnRip < 65536 ||

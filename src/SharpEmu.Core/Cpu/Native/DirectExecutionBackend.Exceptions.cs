@@ -18,7 +18,30 @@ public sealed partial class DirectExecutionBackend
 	private const ulong LazyCommitWindowBytes = 0x0200_0000UL;
 	private static int _lazyCommitTraceCount;
 	private static int _guestAllocatorHoleRecoveries;
+	private static int _guestAllocatorCorruptFreeListRecoveries;
 	private static int _auxiliaryThreadExecuteFaultRecoveries;
+	private const uint NativeWriteWatchArmException = 0xE0425741u;
+	private const uint StatusSingleStep = 0x80000004u;
+	private const int ContextEFlagsOffset = 0x44;
+	private const int ContextDr3Offset = 0x60;
+	private const int ContextDr6Offset = 0x68;
+	private const int ContextDr7Offset = 0x70;
+	private const uint ContextAmd64DebugRegisters = 0x00100010u;
+	private const ulong Dr6Breakpoint3 = 1UL << 3;
+	private const ulong Dr7Breakpoint3Mask = (3UL << 6) | (15UL << 28);
+	private const ulong Dr7Breakpoint3Write8 = (1UL << 6) | (1UL << 28) | (2UL << 30);
+	private const ulong RewiredFreeListMarker = 0x5F64657269776552UL;
+	private static readonly ulong NativeWriteWatchAddress = ParseNativeWriteWatchAddress(
+		Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_WRITE_WATCH"));
+	private static readonly ulong NativeWriteWatchExpectedValue = ParseNativeWriteWatchValue(
+		Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_WRITE_WATCH_VALUE"));
+	private static readonly string? NativeWriteWatchThreadFilter =
+		Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_WRITE_WATCH_THREAD");
+	private static int _nativeWriteWatchHit;
+	private static int _nativeWriteWatchArmCount;
+
+	[ThreadStatic]
+	private static bool _nativeWriteWatchArmedForThread;
 
 	private unsafe void SetupExceptionHandler()
 	{
@@ -110,6 +133,10 @@ public sealed partial class DirectExecutionBackend
 
 			ulong rip = ReadCtxU64(contextRecord, 248);
 			ulong rsp = ReadCtxU64(contextRecord, 152);
+			if (TryHandleNativeWriteWatchException(exceptionCode, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (TryRecoverGuestInt41(exceptionCode, contextRecord, rip))
 			{
 				return -1;
@@ -120,6 +147,11 @@ public sealed partial class DirectExecutionBackend
 			}
 
 			if (exceptionCode == 3221225477u && TryHandleLazyCommittedPage(exceptionRecord, rip, rsp))
+			{
+				return -1;
+			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverGuestAllocatorCorruptFreeList(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -489,6 +521,244 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
+	private unsafe void EnsureNativeWriteWatchArmedForCurrentThread()
+	{
+		if (!OperatingSystem.IsWindows() ||
+			NativeWriteWatchAddress == 0 ||
+			Volatile.Read(ref _nativeWriteWatchHit) != 0 ||
+			_nativeWriteWatchArmedForThread)
+		{
+			return;
+		}
+		if (!string.IsNullOrWhiteSpace(NativeWriteWatchThreadFilter) &&
+			!string.Equals(
+				_activeGuestThreadState?.Name,
+				NativeWriteWatchThreadFilter,
+				StringComparison.Ordinal))
+		{
+			return;
+		}
+
+		_nativeWriteWatchArmedForThread = true;
+		try
+		{
+			Win32RaiseException(NativeWriteWatchArmException, 0, 0, null);
+		}
+		catch (Exception ex)
+		{
+			_nativeWriteWatchArmedForThread = false;
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] native_write_watch could not arm thread " +
+				$"{Environment.CurrentManagedThreadId}: {ex.GetType().Name}: {ex.Message}");
+		}
+	}
+
+	private unsafe bool TryHandleNativeWriteWatchException(
+		uint exceptionCode,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (NativeWriteWatchAddress == 0 || !OperatingSystem.IsWindows())
+		{
+			return false;
+		}
+
+		if (exceptionCode == NativeWriteWatchArmException)
+		{
+			WriteCtxU32(contextRecord, Win64ContextFlagsOffset,
+				ReadCtxU32(contextRecord, Win64ContextFlagsOffset) | ContextAmd64DebugRegisters);
+			WriteCtxU64(contextRecord, ContextDr3Offset, NativeWriteWatchAddress);
+			WriteCtxU64(contextRecord, ContextDr6Offset,
+				ReadCtxU64(contextRecord, ContextDr6Offset) & ~Dr6Breakpoint3);
+			var dr7 = ReadCtxU64(contextRecord, ContextDr7Offset);
+			WriteCtxU64(contextRecord, ContextDr7Offset,
+				(dr7 & ~Dr7Breakpoint3Mask) | Dr7Breakpoint3Write8);
+			var armCount = Interlocked.Increment(ref _nativeWriteWatchArmCount);
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] native_write_watch armed#{armCount}: " +
+				$"addr=0x{NativeWriteWatchAddress:X16} " +
+				$"managed_thread={Environment.CurrentManagedThreadId} " +
+				$"guest_thread=0x{_activeGuestThreadState?.ThreadHandle ?? 0:X16} " +
+				$"guest_name='{_activeGuestThreadState?.Name ?? "<none>"}'");
+			return true;
+		}
+
+		if (exceptionCode != StatusSingleStep ||
+			(ReadCtxU64(contextRecord, ContextDr6Offset) & Dr6Breakpoint3) == 0 ||
+			ReadCtxU64(contextRecord, ContextDr3Offset) != NativeWriteWatchAddress)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, ContextDr6Offset,
+			ReadCtxU64(contextRecord, ContextDr6Offset) & ~Dr6Breakpoint3);
+
+		ulong value = TryReadHostQword(NativeWriteWatchAddress, out var watchedValue)
+			? watchedValue
+			: 0;
+		var expectedValue = NativeWriteWatchExpectedValue != 0
+			? NativeWriteWatchExpectedValue
+			: RewiredFreeListMarker;
+		if (value != expectedValue)
+		{
+			// Keep the watchpoint armed through allocator initialization and normal
+			// free-list maintenance. We only need the instruction that installs the
+			// impossible ASCII pointer observed at the eventual crash.
+			return true;
+		}
+
+		var currentDr7 = ReadCtxU64(contextRecord, ContextDr7Offset);
+		WriteCtxU64(contextRecord, ContextDr7Offset, currentDr7 & ~Dr7Breakpoint3Mask);
+		WriteCtxU32(contextRecord, ContextEFlagsOffset,
+			ReadCtxU32(contextRecord, ContextEFlagsOffset) & ~0x100u);
+		Interlocked.Exchange(ref _nativeWriteWatchHit, 1);
+
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] native_write_watch HIT addr=0x{NativeWriteWatchAddress:X16} " +
+			$"value=0x{value:X16} rip_after=0x{rip:X16} " +
+			$"managed_thread={Environment.CurrentManagedThreadId} " +
+			$"guest_thread=0x{_activeGuestThreadState?.ThreadHandle ?? 0:X16} " +
+			$"guest_name='{_activeGuestThreadState?.Name ?? "<none>"}'");
+		if (TryFormatNearestRuntimeSymbol(rip, out var symbol))
+		{
+			Console.Error.WriteLine($"[LOADER][WARN] native_write_watch RIP symbol: {symbol}");
+		}
+		if (rip >= 32)
+		{
+			var codeWindow = new byte[48];
+			if (TryReadHostBytes(rip - 32, codeWindow))
+			{
+				Console.Error.WriteLine(
+					"[LOADER][WARN] native_write_watch code [RIP-0x20..]: " +
+					BitConverter.ToString(codeWindow).Replace("-", " "));
+			}
+		}
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] native_write_watch registers: " +
+			$"rax=0x{ReadCtxU64(contextRecord, 120):X16} " +
+			$"rbx=0x{ReadCtxU64(contextRecord, 144):X16} " +
+			$"rcx=0x{ReadCtxU64(contextRecord, 128):X16} " +
+			$"rdx=0x{ReadCtxU64(contextRecord, 136):X16} " +
+			$"rsi=0x{ReadCtxU64(contextRecord, 168):X16} " +
+			$"rdi=0x{ReadCtxU64(contextRecord, 176):X16} " +
+			$"r15=0x{ReadCtxU64(contextRecord, 240):X16} " +
+			$"rsp=0x{ReadCtxU64(contextRecord, 152):X16}");
+		Console.Error.Flush();
+		return true;
+	}
+
+	private static ulong ParseNativeWriteWatchAddress(string? text)
+	{
+		if (string.IsNullOrWhiteSpace(text))
+		{
+			return 0;
+		}
+
+		text = text.Trim();
+		if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+		{
+			text = text[2..];
+		}
+
+		return ulong.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address) &&
+			(address & 7) == 0
+			? address
+			: 0;
+	}
+
+	private static ulong ParseNativeWriteWatchValue(string? text)
+	{
+		if (string.IsNullOrWhiteSpace(text))
+		{
+			return 0;
+		}
+
+		text = text.Trim();
+		if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+		{
+			text = text[2..];
+		}
+
+		return ulong.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var value)
+			? value
+			: 0;
+	}
+
+	[DllImport("kernel32.dll", EntryPoint = "RaiseException")]
+	private static extern unsafe void Win32RaiseException(
+		uint exceptionCode,
+		uint exceptionFlags,
+		uint numberOfArguments,
+		ulong* arguments);
+
+	private unsafe bool TryRecoverGuestAllocatorCorruptFreeList(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (!string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_EXPERIMENT_RECOVER_CORRUPT_GUEST_FREE_LIST"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 ||
+			ReadCtxU64(contextRecord, CTX_R15) != RewiredFreeListMarker ||
+			rip < 6)
+		{
+			return false;
+		}
+
+		// Match:
+		//   mov r15,[rcx+rax*8]
+		//   test r15,r15
+		//   je   empty-list
+		//   mov rdx,[r15]       ; faults because the slot contains "Rewired_"
+		byte[] branchWindow = new byte[13];
+		byte[] faultInstruction = new byte[3];
+		if (!TryReadHostBytes(rip - 13, branchWindow) ||
+			!TryReadHostBytes(rip, faultInstruction) ||
+			!branchWindow.AsSpan(0, 4).SequenceEqual(new byte[] { 0x4C, 0x8B, 0x3C, 0xC1 }) ||
+			!branchWindow.AsSpan(4, 3).SequenceEqual(new byte[] { 0x4D, 0x85, 0xFF }) ||
+			branchWindow[7] != 0x0F || branchWindow[8] != 0x84 ||
+			!faultInstruction.AsSpan().SequenceEqual(new byte[] { 0x49, 0x8B, 0x17 }))
+		{
+			return false;
+		}
+
+		var tableBase = ReadCtxU64(contextRecord, CTX_RCX);
+		var bucket = ReadCtxU64(contextRecord, CTX_RAX);
+		if (bucket > 0x1000 || tableBase > ulong.MaxValue - (bucket * sizeof(ulong)))
+		{
+			return false;
+		}
+
+		var slotAddress = tableBase + (bucket * sizeof(ulong));
+		if (!TryReadHostQword(slotAddress, out var slotValue) || slotValue != RewiredFreeListMarker)
+		{
+			return false;
+		}
+
+		Span<byte> clearedSlot = stackalloc byte[sizeof(ulong)];
+		clearedSlot.Clear();
+		var memory = _cpuContext?.Memory;
+		if (memory is null || !memory.TryWrite(slotAddress, clearedSlot))
+		{
+			return false;
+		}
+
+		var emptyListDisplacement = BinaryPrimitives.ReadInt32LittleEndian(branchWindow.AsSpan(9, 4));
+		var emptyListRip = unchecked((ulong)((long)rip + emptyListDisplacement));
+		WriteCtxU64(contextRecord, CTX_R15, 0);
+		WriteCtxU64(contextRecord, CTX_RIP, emptyListRip);
+		var recovery = Interlocked.Increment(ref _guestAllocatorCorruptFreeListRecoveries);
+		Console.Error.WriteLine(
+			$"[LOADER][EXPERIMENT] Recovered corrupt guest allocator free-list #{recovery}: " +
+			$"slot=0x{slotAddress:X16} bucket={bucket} marker='Rewired_' " +
+			$"rip=0x{rip:X16} -> empty=0x{emptyListRip:X16}");
+		Console.Error.Flush();
+		return true;
+	}
+
 	private unsafe static bool TryRecoverGuestAllocatorHole(
 		EXCEPTION_RECORD* exceptionRecord,
 		void* contextRecord,
@@ -621,6 +891,14 @@ public sealed partial class DirectExecutionBackend
 		if (rip >= 0x20)
 		{
 			DumpGuestInstructionStream("fault-prelude", rip - 0x20, 24);
+		}
+		if (rip >= 0x85)
+		{
+			// The recurring Unity/IL2CPP allocator fault enters its current
+			// function 0x85 bytes before the failing free-list dereference.
+			// Starting at the real prologue avoids the intentionally unaligned
+			// rip-0x20 diagnostic and exposes the lock/result branch as well.
+			DumpGuestInstructionStream("fault-function", rip - 0x85, 64);
 		}
 
 		// Optimized guest code frequently omits frame pointers. The return
