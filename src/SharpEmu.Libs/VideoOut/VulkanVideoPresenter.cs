@@ -2914,6 +2914,8 @@ internal static unsafe class VulkanVideoPresenter
         // program content and descriptor-layout shape instead.
         private readonly Dictionary<ComputePipelineKey, Pipeline> _computePipelines = new();
         private readonly Dictionary<GraphicsPipelineKey, Pipeline> _graphicsPipelines = new();
+        private readonly HashSet<string> _tracedGraphicsPipelineFallbacks =
+            new(StringComparer.Ordinal);
         private readonly Dictionary<GuestSampler, Sampler> _samplers = new();
         private readonly Dictionary<byte[], string> _shaderDigests =
             new(ReferenceEqualityComparer.Instance);
@@ -4802,16 +4804,36 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
+            if (TraceVulkanQueueFlow)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] vk.queue_flow flush_begin " +
+                    $"draws={_batchDrawCount} resources={_batchResources.Count} " +
+                    $"pending={_pendingGuestSubmissions.Count}");
+            }
+
             CloseOpenTranslatedRenderPass();
             _batchOpen = false;
             try
             {
+                if (TraceVulkanQueueFlow)
+                {
+                    Console.Error.WriteLine("[LOADER][TRACE] vk.queue_flow end_command_begin");
+                }
                 Check(_vk.EndCommandBuffer(_batchCommandBuffer), "vkEndCommandBuffer(batch)");
+                if (TraceVulkanQueueFlow)
+                {
+                    Console.Error.WriteLine("[LOADER][TRACE] vk.queue_flow end_command_done");
+                }
                 SubmitGuestCommandBuffer(
                     _batchCommandBuffer,
                     _batchResources.ToArray(),
                     _batchTraceImages.ToArray(),
                     _batchRetireBuffers.Count > 0 ? _batchRetireBuffers.ToArray() : []);
+                if (TraceVulkanQueueFlow)
+                {
+                    Console.Error.WriteLine("[LOADER][TRACE] vk.queue_flow flush_done");
+                }
             }
             catch
             {
@@ -4857,9 +4879,19 @@ internal static unsafe class VulkanVideoPresenter
                     CommandBufferCount = 1,
                     PCommandBuffers = &commandBuffer,
                 };
+                if (TraceVulkanQueueFlow)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.queue_flow submit_begin " +
+                        $"resources={resources.Count} pending={_pendingGuestSubmissions.Count}");
+                }
                 Check(
                     _vk.QueueSubmit(_queue, 1, &submitInfo, fence),
                     "vkQueueSubmit(guest)");
+                if (TraceVulkanQueueFlow)
+                {
+                    Console.Error.WriteLine("[LOADER][TRACE] vk.queue_flow submit_done");
+                }
             }
             catch
             {
@@ -4985,12 +5017,24 @@ internal static unsafe class VulkanVideoPresenter
                 // finishes it on a later frame.
                 var isProbeWait = maxWaitNs != 0 && maxWaitNs < _guestFenceWaitTimeoutNs;
                 var waitNs = maxWaitNs != 0 ? maxWaitNs : _guestFenceWaitTimeoutNs;
+                if (TraceVulkanQueueFlow)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.queue_flow fence_wait_begin " +
+                        $"timeline={oldest.Timeline} wait_ns={waitNs} " +
+                        $"pending={_pendingGuestSubmissions.Count}");
+                }
                 var result = _vk.WaitForFences(
                     _device,
                     1,
                     &fence,
                     true,
                     waitNs);
+                if (TraceVulkanQueueFlow)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.queue_flow fence_wait_done result={result}");
+                }
                 if (result == Result.Timeout)
                 {
                     // A GPU submission whose fence never signals (typically a
@@ -6510,6 +6554,57 @@ internal static unsafe class VulkanVideoPresenter
             {
                 resources.Pipeline = cachedPipeline;
                 resources.PipelineCached = true;
+                return;
+            }
+
+            var pipelineKeyDigest = Convert.ToHexString(
+                SHA256.HashData(Encoding.UTF8.GetBytes(pipelineKey.ToString())));
+            if (_traceVulkanPipelineCreate)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] vk.pipeline_cache_miss " +
+                    $"key_hash={pipelineKeyDigest[..8]} " +
+                    $"vs_hash={pipelineKey.VertexShader[..8]} " +
+                    $"ps_hash={pipelineKey.FragmentShader[..8]} " +
+                    $"formats={pipelineKey.RenderTargetLayout} " +
+                    $"depth={(pipelineKey.HasDepthAttachment ? 1 : 0)} " +
+                    $"topology={pipelineKey.Topology} " +
+                    $"resources={pipelineKey.ResourceLayout} " +
+                    $"vertices={pipelineKey.VertexLayout} " +
+                    $"raster={pipelineKey.Raster} depth_state={pipelineKey.Depth}");
+            }
+
+            var matchedPipelineKey = _skipGraphicsPipelineKeyHashes.FirstOrDefault(prefix =>
+                pipelineKeyDigest.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+            if (matchedPipelineKey is not null)
+            {
+                throw new InvalidOperationException(
+                    $"Experimental graphics pipeline skip: key_hash={pipelineKeyDigest[..8]} " +
+                    $"matched={matchedPipelineKey}");
+            }
+
+            var matchedFallbackKey = _fallbackGraphicsPipelineKeyHashes.FirstOrDefault(prefix =>
+                pipelineKeyDigest.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+            if (matchedFallbackKey is not null)
+            {
+                if (_tracedGraphicsPipelineFallbacks.Add(pipelineKeyDigest))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][EXPERIMENT] vk.graphics_pipeline_fallback " +
+                        $"key_hash={pipelineKeyDigest[..8]} matched={matchedFallbackKey} " +
+                        "replacement=fullscreen-solid");
+                }
+
+                resources.VertexCount = 3;
+                resources.InstanceCount = 1;
+                resources.Topology = PrimitiveTopology.TriangleList;
+                CreateTranslatedPipeline(
+                    resources,
+                    SpirvFixedShaders.CreateFullscreenVertex(0),
+                    SpirvFixedShaders.CreateSolidFragment(1f, 0f, 1f, 1f),
+                    renderPass,
+                    renderTargetFormats,
+                    extent);
                 return;
             }
 
@@ -8178,8 +8273,15 @@ internal static unsafe class VulkanVideoPresenter
             uint height,
             Format format)
         {
-            if (!_traceGuestImageAddressFilterEnabled ||
-                !AddressListContains("SHARPEMU_TRACE_GUEST_IMAGE_ADDRS", texture.Address) ||
+            var traceByAddress = _traceGuestImageAddressFilterEnabled &&
+                AddressListContains("SHARPEMU_TRACE_GUEST_IMAGE_ADDRS", texture.Address);
+            var traceVideoPlanes = string.Equals(
+                    Environment.GetEnvironmentVariable("SHARPEMU_TRACE_VIDEO_TEXTURES"),
+                    "1",
+                    StringComparison.Ordinal) &&
+                ((width == 2560 && height == 1440 && format == Format.R8Unorm) ||
+                 (width == 1280 && height == 720 && format == Format.R8G8Unorm));
+            if ((!traceByAddress && !traceVideoPlanes) ||
                 !_tracedTextureUploadContents.Add(
                     (texture.Address, width, height, texture.Format)))
             {
@@ -10455,6 +10557,40 @@ internal static unsafe class VulkanVideoPresenter
                     RenderState = work.Draw.RenderState with { Blends = normalizedBlends },
                 };
 
+            if (_skipGraphicsPixelShaderHashes.Length != 0)
+            {
+                var pixelDigest = GetShaderDigest(draw.PixelSpirv);
+                var matchedPrefix = _skipGraphicsPixelShaderHashes.FirstOrDefault(prefix =>
+                    pixelDigest.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+                if (matchedPrefix is not null)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][EXPERIMENT] vk.graphics_skip " +
+                        $"ps=0x{work.ShaderAddress:X16} ps_hash={pixelDigest[..8]} " +
+                        $"matched={matchedPrefix} mrt={work.Targets.Count}");
+                    ReturnPooledGuestData(work.Draw);
+                    return;
+                }
+            }
+
+            if (_skipUnattributedDepthGraphics &&
+                work.Targets.Count == 1 &&
+                work.DepthTarget is not null &&
+                draw.AttributeCount == 0 &&
+                draw.VertexBuffers.Count == 3 &&
+                draw.Textures.Count == 0 &&
+                draw.GlobalMemoryBuffers.Count >= 12)
+            {
+                var pixelDigest = GetShaderDigest(draw.PixelSpirv);
+                Console.Error.WriteLine(
+                    $"[LOADER][EXPERIMENT] vk.graphics_signature_skip " +
+                    $"ps=0x{work.ShaderAddress:X16} ps_hash={pixelDigest[..8]} " +
+                    $"attrs=0 vertex_buffers=3 textures=0 " +
+                    $"globals={draw.GlobalMemoryBuffers.Count} depth=1");
+                ReturnPooledGuestData(work.Draw);
+                return;
+            }
+
             if (!_supportsIndependentBlend)
             {
                 for (var index = 1; index < draw.RenderState.Blends.Count; index++)
@@ -10649,6 +10785,23 @@ internal static unsafe class VulkanVideoPresenter
                         attachedDepth?.Initialized == true && !clearDepthForDraw);
                     transientRenderPass = renderPass;
                     transientFramebuffer = framebuffer;
+                }
+
+                if (_traceVulkanPipelineCreate)
+                {
+                    var vertexDigest = Convert.ToHexString(
+                        SHA256.HashData(draw.VertexSpirv).AsSpan(0, 4));
+                    var pixelDigest = Convert.ToHexString(
+                        SHA256.HashData(draw.PixelSpirv).AsSpan(0, 4));
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.pipeline_create_begin " +
+                        $"ps=0x{work.ShaderAddress:X16} vs_hash={vertexDigest} " +
+                        $"ps_hash={pixelDigest} vs_bytes={draw.VertexSpirv.Length} " +
+                        $"ps_bytes={draw.PixelSpirv.Length} mrt={targets.Length} " +
+                        $"formats=[{string.Join(',', formats.Select(format => (uint)format))}] " +
+                        $"attrs={draw.AttributeCount} vertex_buffers={draw.VertexBuffers.Count} " +
+                        $"textures={draw.Textures.Count} globals={draw.GlobalMemoryBuffers.Count} " +
+                        $"depth={(depth is null || clearDepthSeparately ? 0 : 1)}");
                 }
 
                 resources = CreateTranslatedDrawResources(
@@ -14164,6 +14317,39 @@ internal static unsafe class VulkanVideoPresenter
                 Environment.GetEnvironmentVariable("SHARPEMU_LOG_VK_RESOURCES"),
                 "1",
                 StringComparison.Ordinal);
+        private static readonly bool _traceVulkanPipelineCreate =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_VK_PIPELINE_CREATE"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly bool _traceVulkanQueueFlow =
+            string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_VK_QUEUE_FLOW"),
+                "1",
+                StringComparison.Ordinal);
+        private static volatile bool _traceVulkanQueueFlowTriggered;
+        private static readonly System.Threading.Timer? _traceVulkanQueueFlowTriggerTimer =
+            CreateVulkanQueueFlowTriggerTimer();
+        private static bool TraceVulkanQueueFlow =>
+            _traceVulkanQueueFlow || _traceVulkanQueueFlowTriggered;
+        private static readonly string[] _skipGraphicsPixelShaderHashes =
+            ParseShaderHashPrefixes(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_EXPERIMENT_SKIP_GRAPHICS_PS_HASHES"));
+        private static readonly bool _skipUnattributedDepthGraphics =
+            string.Equals(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_EXPERIMENT_SKIP_UNATTRIBUTED_DEPTH_GRAPHICS"),
+                "1",
+                StringComparison.Ordinal);
+        private static readonly string[] _skipGraphicsPipelineKeyHashes =
+            ParseShaderHashPrefixes(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_EXPERIMENT_SKIP_GRAPHICS_PIPELINE_KEYS"));
+        private static readonly string[] _fallbackGraphicsPipelineKeyHashes =
+            ParseShaderHashPrefixes(
+                Environment.GetEnvironmentVariable(
+                    "SHARPEMU_EXPERIMENT_FALLBACK_GRAPHICS_PIPELINE_KEYS"));
         private static readonly bool _traceVulkanShaderEnabled =
             string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC"),
@@ -14302,7 +14488,63 @@ internal static unsafe class VulkanVideoPresenter
                 long.TryParse(mode.AsSpan("large@".Length), out var ordinal) &&
                 ordinal > 0
                     ? ordinal
-                    : 0;
+                : 0;
+        }
+
+        private static string[] ParseShaderHashPrefixes(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return [];
+            }
+
+            return value.Split(
+                    [',', ';', ' ', '\t'],
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(static token => token.All(Uri.IsHexDigit))
+                .Select(static token => token.ToUpperInvariant())
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+        }
+
+        private static System.Threading.Timer? CreateVulkanQueueFlowTriggerTimer()
+        {
+            var configured = Environment.GetEnvironmentVariable(
+                "SHARPEMU_LOG_VK_QUEUE_FLOW_TRIGGER_FILE");
+            if (string.IsNullOrWhiteSpace(configured))
+            {
+                return null;
+            }
+
+            string triggerPath;
+            try
+            {
+                triggerPath = Path.GetFullPath(
+                    Environment.ExpandEnvironmentVariables(configured));
+            }
+            catch
+            {
+                return null;
+            }
+
+            return new System.Threading.Timer(
+                static state =>
+                {
+                    try
+                    {
+                        if (File.Exists((string)state!))
+                        {
+                            _traceVulkanQueueFlowTriggered = true;
+                        }
+                    }
+                    catch
+                    {
+                        // Diagnostics must never affect guest execution.
+                    }
+                },
+                triggerPath,
+                dueTime: 250,
+                period: 250);
         }
 
         private static bool ShouldTraceGuestImageContentsForDiagnostics() =>

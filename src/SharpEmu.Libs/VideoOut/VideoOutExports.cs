@@ -198,6 +198,7 @@ public static class VideoOutExports
         public ulong VblankCount { get; set; }
         public ulong FlipCount { get; set; }
         public int CurrentBuffer { get; set; } = -1;
+        public long LastCompletedFlipArg { get; set; }
         public uint OutputWidth { get; set; } = 1920;
         public uint OutputHeight { get; set; } = 1080;
         public uint RefreshRate { get; set; } = 60;
@@ -710,16 +711,21 @@ public static class VideoOutExports
 
         ulong count;
         uint currentBuffer;
+        long lastCompletedFlipArg;
         lock (_stateGate)
         {
             count = port.FlipCount;
             currentBuffer = unchecked((uint)port.CurrentBuffer);
+            lastCompletedFlipArg = port.LastCompletedFlipArg;
         }
 
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, count);
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, 0);
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, 0);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(
+            ctx,
+            statusAddress + 0x18,
+            unchecked((ulong)lastCompletedFlipArg));
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, currentBuffer);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1193,6 +1199,15 @@ public static class VideoOutExports
 
         void TriggerFlipEvents()
         {
+            // SceVideoOutFlipStatus.flipArg describes the last completed flip,
+            // not merely the last one submitted. AGC calls this action only
+            // after the preceding GPU work has completed, preserving that
+            // distinction for games that recycle buffers from the flip thread.
+            lock (_stateGate)
+            {
+                port.LastCompletedFlipArg = flipArg;
+            }
+
             if (flipEvents is null)
             {
                 return;

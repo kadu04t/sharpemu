@@ -17,6 +17,9 @@ namespace SharpEmu.Libs.Kernel;
 
 public static partial class KernelMemoryCompatExports
 {
+    [ThreadStatic]
+    private static ulong _lastDirectMappingOnCurrentThread;
+
     private const int MaxGuestStringLength = 4096;
     private const int WideCharSize = sizeof(ushort);
     private const int MemsetChunkSize = 16 * 1024;
@@ -3109,8 +3112,19 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        _lastDirectMappingOnCurrentThread = mappedAddress;
         GuestWriteWatch.OnDirectMapping(mappedAddress, length, protection);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    internal static void ResetLastDirectMappingForCallback() =>
+        _lastDirectMappingOnCurrentThread = 0;
+
+    internal static bool TryTakeLastDirectMappingForCallback(out ulong address)
+    {
+        address = _lastDirectMappingOnCurrentThread;
+        _lastDirectMappingOnCurrentThread = 0;
+        return address != 0;
     }
 
     [SysAbiExport(
@@ -5982,15 +5996,54 @@ public static partial class KernelMemoryCompatExports
 
     private static bool TryProtectHostRange(ulong address, ulong length, int orbisProtection)
     {
-        if (length == 0 || length > nuint.MaxValue)
+        if (length == 0 || length > nuint.MaxValue ||
+            !TryAddU64(address, length, out var endAddress))
         {
             return false;
         }
 
-        var hostProtection = ResolveHostProtection(orbisProtection);
-        if (!VirtualProtect((nint)address, (nuint)length, hostProtection, out _))
+        // A guest range can be contiguous while being backed by several adjacent
+        // host reservations. Windows VirtualProtect rejects a call that crosses
+        // reservation boundaries, even when every page is committed. Query the
+        // complete range first so an unmapped page cannot leave us with a partial
+        // protection change, then protect each host region separately.
+        var segments = new List<(ulong Address, ulong Length)>();
+        var cursor = address;
+        var querySize = (nuint)Marshal.SizeOf<MemoryBasicInformation>();
+        while (cursor < endAddress)
         {
-            return false;
+            if (VirtualQuery((nint)cursor, out var info, querySize) == 0 ||
+                info.State != MemCommit ||
+                info.RegionSize == 0)
+            {
+                return false;
+            }
+
+            var regionAddress = unchecked((ulong)info.BaseAddress);
+            var regionLength = (ulong)info.RegionSize;
+            if (regionAddress > cursor ||
+                !TryAddU64(regionAddress, regionLength, out var regionEnd) ||
+                regionEnd <= cursor)
+            {
+                return false;
+            }
+
+            var segmentEnd = Math.Min(regionEnd, endAddress);
+            segments.Add((cursor, segmentEnd - cursor));
+            cursor = segmentEnd;
+        }
+
+        var hostProtection = ResolveHostProtection(orbisProtection);
+        foreach (var segment in segments)
+        {
+            if (!VirtualProtect(
+                    (nint)segment.Address,
+                    (nuint)segment.Length,
+                    hostProtection,
+                    out _))
+            {
+                return false;
+            }
         }
 
         return true;

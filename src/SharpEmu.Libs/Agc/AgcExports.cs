@@ -2655,6 +2655,8 @@ public static partial class AgcExports
     {
         var eventAddress = ctx[CpuRegister.Rdi];
         if (eventAddress == 0 ||
+            !TryReadUInt64(ctx, eventAddress, out var eventIdent) ||
+            !TryReadUInt32(ctx, eventAddress + 0x08, out var filterAndFlags) ||
             !TryReadUInt64(ctx, eventAddress + 0x10, out var eventData))
         {
             // This API returns the id directly rather than an Orbis status.
@@ -2665,10 +2667,14 @@ public static partial class AgcExports
             return 0;
         }
 
-        var contextId = (uint)eventData;
+        var filter = unchecked((short)(filterAndFlags & 0xFFFF));
+        var contextId = filter == KernelEventQueueCompatExports.KernelEventFilterGraphics
+            ? (uint)eventData
+            : (uint)eventIdent;
         ctx[CpuRegister.Rax] = contextId;
         TraceAgc(
-            $"agc.driver_get_eq_context_id event=0x{eventAddress:X16} context={contextId}");
+            $"agc.driver_get_eq_context_id event=0x{eventAddress:X16} " +
+            $"filter={filter} context={contextId}");
         return unchecked((int)contextId);
     }
 
@@ -3452,17 +3458,33 @@ public static partial class AgcExports
                     state.TranslatedDraw = null;
                 }
 
-                if (VideoOutExports.TryGetDisplayBufferInfo(
-                        handle,
-                        displayBufferIndex,
-                        out var cachedDisplayBuffer) &&
+                var hasCachedDisplayBuffer = VideoOutExports.TryGetDisplayBufferInfo(
+                    handle,
+                    displayBufferIndex,
+                    out var cachedDisplayBuffer);
+                var submittedOrderedFlip = hasCachedDisplayBuffer &&
                     GuestGpu.Current.TrySubmitOrderedGuestImageFlip(
                         handle,
                         displayBufferIndex,
                         cachedDisplayBuffer.Address,
                         cachedDisplayBuffer.Width,
                         cachedDisplayBuffer.Height,
-                        cachedDisplayBuffer.PitchInPixel))
+                        cachedDisplayBuffer.PitchInPixel);
+                if (ShouldTraceAgcFlipFlow())
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.flip_flow queue={state.QueueName} " +
+                        $"submission={state.ActiveSubmissionId} handle={handle} " +
+                        $"index={displayBufferIndex} mode={flipMode} arg={flipArg} " +
+                        $"buffer_known={(hasCachedDisplayBuffer ? 1 : 0)} " +
+                        $"addr=0x{(hasCachedDisplayBuffer ? cachedDisplayBuffer.Address : 0):X16} " +
+                        $"ordered_submitted={(submittedOrderedFlip ? 1 : 0)} " +
+                        $"saw_indexed={(state.SawIndexedDraw ? 1 : 0)} " +
+                        $"translated={(state.TranslatedDraw is not null ? 1 : 0)} " +
+                        $"pending_targetless={(state.PendingTargetlessDraw is not null ? 1 : 0)}");
+                }
+
+                if (submittedOrderedFlip)
                 {
                     TraceDisplayBuffer(
                         handle,
@@ -11238,6 +11260,24 @@ public static partial class AgcExports
         }
 
         Console.Error.WriteLine($"[LOADER][TRACE] {message}");
+    }
+
+    private static bool ShouldTraceAgcFlipFlow()
+    {
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_FLIP_FLOW"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // Share the late-activation trigger used by Vulkan queue diagnostics so
+        // boot remains undisturbed and flip routing becomes visible only when
+        // the user reaches the scene under investigation.
+        var triggerFile = Environment.GetEnvironmentVariable(
+            "SHARPEMU_LOG_VK_QUEUE_FLOW_TRIGGER_FILE");
+        return !string.IsNullOrWhiteSpace(triggerFile) && File.Exists(triggerFile);
     }
 
     private static void TraceAgcShader(

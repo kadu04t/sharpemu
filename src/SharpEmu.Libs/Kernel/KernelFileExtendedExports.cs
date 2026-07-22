@@ -86,13 +86,47 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, read)))
+        if (read > 0 && !TryWriteGuestBufferPaged(ctx.Memory, bufferAddress, buffer.AsSpan(0, read)))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         ctx[CpuRegister.Rax] = unchecked((ulong)read);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    /// <summary>
+    /// Writes a file payload without requiring the complete guest buffer to
+    /// belong to one host allocation. Guest mappings are page-aligned, while a
+    /// large pread buffer may legitimately span several adjacent mappings.
+    /// Keeping each write inside one guest page lets the memory implementation
+    /// validate every mapped page independently and still rejects real holes.
+    /// </summary>
+    internal static bool TryWriteGuestBufferPaged(
+        ICpuMemory memory,
+        ulong address,
+        ReadOnlySpan<byte> source)
+    {
+        var written = 0;
+        while (written < source.Length)
+        {
+            var currentAddress = address + (ulong)written;
+            if (currentAddress < address)
+            {
+                return false;
+            }
+
+            var bytesUntilPageEnd = OrbisPageSize - (currentAddress & (OrbisPageSize - 1));
+            var chunkLength = (int)Math.Min((ulong)(source.Length - written), bytesUntilPageEnd);
+            if (!memory.TryWrite(currentAddress, source.Slice(written, chunkLength)))
+            {
+                return false;
+            }
+
+            written += chunkLength;
+        }
+
+        return true;
     }
 
     [SysAbiExport(Nid = "C2kJ-byS5rM", ExportName = "pwrite",

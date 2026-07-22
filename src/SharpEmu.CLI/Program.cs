@@ -257,6 +257,8 @@ internal static partial class Program
             return 2;
         }
 
+        ApplyAutomaticCompatibilityProfile(ebootPath);
+
         if (!TryGetDebugServerOptions(args, out var debugServerEnabled, out var debugServerOptions, out var debugServerError))
         {
             Log.Error($"Invalid --debug-server endpoint: {debugServerError}");
@@ -783,6 +785,49 @@ internal static partial class Program
         }
 
         return null;
+    }
+
+    private static void ApplyAutomaticCompatibilityProfile(string ebootPath)
+    {
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_AUTOMATIC_COMPATIBILITY"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var titleId = TryReadTitleId(ebootPath);
+        if (!string.Equals(titleId, "PPSA16786", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        // Neva currently needs these narrowly-scoped compatibility experiments
+        // to traverse Unity loading, consume the embedded cutscene, and avoid an
+        // AMD driver block while creating the D12C52CE graphics pipeline. Keep
+        // explicit user values authoritative so each workaround can still be
+        // disabled or A/B tested from the environment.
+        SetCompatibilityDefault("SHARPEMU_EXPERIMENT_HLE_LIBC_MEMORY", "1");
+        SetCompatibilityDefault("SHARPEMU_EXPERIMENT_AVPLAYER_MATCH_CONSUMER_KEY", "1");
+        SetCompatibilityDefault("SHARPEMU_EXPERIMENT_SKIP_UNATTRIBUTED_DEPTH_GRAPHICS", "1");
+        SetCompatibilityDefault(
+            "SHARPEMU_EXPERIMENT_FALLBACK_GRAPHICS_PIPELINE_KEYS",
+            "D12C52CE");
+
+        Console.Error.WriteLine(
+            "[COMPAT][INFO] Applied automatic Neva profile for PPSA16786 " +
+            "(HLE libc memory, AvPlayer consumer key, depth filter, " +
+            "pipeline fallback D12C52CE). Set " +
+            "SHARPEMU_DISABLE_AUTOMATIC_COMPATIBILITY=1 to disable it.");
+    }
+
+    private static void SetCompatibilityDefault(string name, string value)
+    {
+        if (Environment.GetEnvironmentVariable(name) is null)
+        {
+            Environment.SetEnvironmentVariable(name, value);
+        }
     }
 
     private static string? TryFindEbootPathToken(IReadOnlyList<string> args)

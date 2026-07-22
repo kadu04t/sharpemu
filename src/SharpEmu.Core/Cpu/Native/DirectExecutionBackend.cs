@@ -886,6 +886,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return nativeEntry();
 	}
 
+	private unsafe static ulong CallNativeEntryU64(void* entry)
+	{
+		var nativeEntry = (delegate* unmanaged[Cdecl]<ulong>)entry;
+		return nativeEntry();
+	}
+
 	private unsafe static void WriteCtxU64(void* contextRecord, int offset, ulong value)
 	{
 		*(ulong*)((byte*)contextRecord + offset) = value;
@@ -2380,6 +2386,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		byte* code = (byte*)ptr;
 		int offset = 0;
+		EmitByte(code, ref offset, 0x49); // mov r12, rax
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0xC4);
 		EmitByte(code, ref offset, 0x48); // sub rsp, 0x20
 		EmitByte(code, ref offset, 0x83);
 		EmitByte(code, ref offset, 0xEC);
@@ -2400,6 +2409,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x8B);
 		EmitByte(code, ref offset, 0x20);
 		EmitHostNonvolatileXmmRestore(code, ref offset);
+		EmitByte(code, ref offset, 0x4C); // mov rax, r12
+		EmitByte(code, ref offset, 0x89);
+		EmitByte(code, ref offset, 0xE0);
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5F);
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5E);
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x5D);
@@ -3538,6 +3550,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		out ulong returnValue,
 		out string? error)
 	{
+		return TryCallGuestFunction(
+			callerContext,
+			entryPoint,
+			arg0,
+			arg1,
+			arg2,
+			0,
+			stackAddress,
+			stackSize,
+			reason,
+			out returnValue,
+			out error);
+	}
+
+	public bool TryCallGuestFunction(
+		CpuContext callerContext,
+		ulong entryPoint,
+		ulong arg0,
+		ulong arg1,
+		ulong arg2,
+		ulong arg3,
+		ulong stackAddress,
+		ulong stackSize,
+		string reason,
+		out ulong returnValue,
+		out string? error)
+	{
 		returnValue = 0;
 		error = null;
 		if (_forcedGuestExit)
@@ -3613,7 +3652,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		context[CpuRegister.Rdi] = arg0;
 		context[CpuRegister.Rsi] = arg1;
 		context[CpuRegister.Rdx] = arg2;
-		context[CpuRegister.Rcx] = 0;
+		context[CpuRegister.Rcx] = arg3;
 		context[CpuRegister.R8] = 0;
 		context[CpuRegister.R9] = 0;
 		if (!InitializeGuestThreadFrame(context))
@@ -4065,9 +4104,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 			if (target.ExecutorActive)
 			{
-				if (_pendingGuestExceptions.ContainsKey(threadHandle) ||
-					_activeGuestExceptionDeliveries.Contains(threadHandle))
+				if (_pendingGuestExceptions.ContainsKey(threadHandle))
 				{
+					return true;
+				}
+				if (_activeGuestExceptionDeliveries.Contains(threadHandle))
+				{
+					// A new stop-the-world cycle can start while the previous
+					// safe-point handler is still unwinding. It is a distinct
+					// suspension request; dropping it here leaves Unity waiting
+					// forever for this thread's SuspendSemaphore acknowledgement.
+					QueuePendingGuestExceptionLocked(threadHandle, new PendingGuestException(
+						handler,
+						exceptionType,
+						exceptionStackBase));
 					return true;
 				}
 				if (target.ExceptionDeliveryActive)
@@ -4354,82 +4404,86 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		CpuContext currentContext,
 		GuestCpuContinuation interruptedContinuation)
 	{
-		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
-		{
-			return;
-		}
-
 		var threadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
 		if (threadHandle == 0)
 		{
 			threadHandle = _currentExternalGuestThreadHandle;
 		}
-		PendingGuestException pending;
-		lock (_guestThreadGate)
+		if (threadHandle == 0)
 		{
-			if (threadHandle == 0)
-			{
-				return;
-			}
-
-			if (!TryRemovePendingGuestExceptionLocked(threadHandle, out pending))
-			{
-				return;
-			}
-
-			_activeGuestExceptionDeliveries.Add(threadHandle);
+			return;
 		}
 
 		const ulong exceptionContextSize = 0x500;
 		const ulong callbackStackOffset = 0x1000;
 		const ulong callbackStackSize = 0xF000;
-		var exceptionContextAddress = pending.ExceptionStackBase + 0x100;
-		try
-		{
-			if (!TryWriteGuestExceptionContext(
-					currentContext,
-					exceptionContextAddress,
-					interruptedContinuation,
-					exceptionContextSize))
-			{
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] Guest exception safe-point context write failed: " +
-					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2}");
-				return;
-			}
 
-			if (string.Equals(
-					Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_EXCEPTIONS"),
-					"1",
-					StringComparison.Ordinal))
-			{
-				Console.Error.WriteLine(
-					$"[LOADER][TRACE] guest_exception.safe_point_enter " +
-					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
-					$"rip=0x{interruptedContinuation.Rip:X16}");
-			}
-
-			if (!TryCallGuestFunction(
-					currentContext,
-					pending.Handler,
-					unchecked((ulong)pending.ExceptionType),
-					exceptionContextAddress,
-					pending.ExceptionStackBase + callbackStackOffset,
-					callbackStackSize,
-					$"kernel exception 0x{pending.ExceptionType:X2} safe point",
-					out var callbackError))
-			{
-				Console.Error.WriteLine(
-					$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
-					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
-					$"error={callbackError ?? "unknown"}");
-			}
-		}
-		finally
+		// Deliver at most one signal at this safe point. Unity repeats its GC
+		// suspension signal until the target thread acknowledges it. Draining in
+		// a loop lets those repeated signals keep replenishing the pending slot,
+		// so the target never returns to guest code to write the acknowledgement.
+		// A coalesced follow-up remains pending for the next import boundary.
+		if (Volatile.Read(ref _pendingGuestExceptionCount) != 0)
 		{
+			PendingGuestException pending;
 			lock (_guestThreadGate)
 			{
-				_activeGuestExceptionDeliveries.Remove(threadHandle);
+				if (!TryRemovePendingGuestExceptionLocked(threadHandle, out pending))
+				{
+					return;
+				}
+
+				_activeGuestExceptionDeliveries.Add(threadHandle);
+			}
+
+			var exceptionContextAddress = pending.ExceptionStackBase + 0x100;
+			try
+			{
+				if (!TryWriteGuestExceptionContext(
+						currentContext,
+						exceptionContextAddress,
+						interruptedContinuation,
+						exceptionContextSize))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Guest exception safe-point context write failed: " +
+						$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2}");
+					return;
+				}
+
+				if (string.Equals(
+						Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_EXCEPTIONS"),
+						"1",
+						StringComparison.Ordinal))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE] guest_exception.safe_point_enter " +
+						$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
+						$"rip=0x{interruptedContinuation.Rip:X16}");
+				}
+
+				if (!TryCallGuestFunction(
+						currentContext,
+						pending.Handler,
+						unchecked((ulong)pending.ExceptionType),
+						exceptionContextAddress,
+						pending.ExceptionStackBase + callbackStackOffset,
+						callbackStackSize,
+						$"kernel exception 0x{pending.ExceptionType:X2} safe point",
+						out var callbackError))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
+						$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
+						$"error={callbackError ?? "unknown"}");
+				}
+			}
+			finally
+			{
+				lock (_guestThreadGate)
+				{
+					_activeGuestExceptionDeliveries.Remove(threadHandle);
+				}
 			}
 		}
 	}
@@ -5240,7 +5294,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				var nativeReturn = CallNativeEntryU64(ptr);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5251,7 +5305,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				context[CpuRegister.Rax] = nativeReturn;
+				reason = $"returned 0x{nativeReturn:X16}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
@@ -5395,7 +5450,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				var nativeReturn = CallNativeEntryU64(ptr);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5406,7 +5461,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					reason = LastError ?? "guest thread forced exit";
 					return GuestNativeCallExitReason.ForcedExit;
 				}
-				reason = $"returned 0x{nativeReturn:X8}";
+				context[CpuRegister.Rax] = nativeReturn;
+				reason = $"returned 0x{nativeReturn:X16}";
 				return GuestNativeCallExitReason.Returned;
 			}
 			catch (AccessViolationException ex)
