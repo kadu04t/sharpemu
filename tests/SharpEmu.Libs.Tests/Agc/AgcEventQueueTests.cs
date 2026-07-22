@@ -157,6 +157,10 @@ public sealed class AgcEventQueueTests
         var memory = new FakeCpuMemory(BaseAddress, MemorySize);
         var ctx = new CpuContext(memory, Generation.Gen5);
         const ulong eventAddress = BaseAddress + 0x500;
+        WriteUInt16(
+            memory,
+            eventAddress + 0x08,
+            unchecked((ushort)KernelEventQueueCompatExports.KernelEventFilterGraphics));
         WriteUInt64(memory, eventAddress + 0x10, 6);
 
         ctx[CpuRegister.Rdi] = eventAddress;
@@ -164,6 +168,23 @@ public sealed class AgcEventQueueTests
 
         Assert.Equal(6, result);
         Assert.Equal(6UL, ctx[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void DriverGetEqContextId_NonGraphicsEventFallsBackToIdent()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        const ulong eventAddress = BaseAddress + 0x580;
+        WriteUInt64(memory, eventAddress, 9);
+        WriteUInt16(memory, eventAddress + 0x08, unchecked((ushort)-11));
+        WriteUInt64(memory, eventAddress + 0x10, 77);
+
+        ctx[CpuRegister.Rdi] = eventAddress;
+        var result = AgcExports.DriverGetEqContextId(ctx);
+
+        Assert.Equal(9, result);
+        Assert.Equal(9UL, ctx[CpuRegister.Rax]);
     }
 
     private static ulong ReadUInt64(FakeCpuMemory memory, ulong address)
@@ -198,6 +219,13 @@ public sealed class AgcEventQueueTests
     {
         Span<byte> buffer = stackalloc byte[8];
         BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
+        Assert.True(memory.TryWrite(address, buffer));
+    }
+
+    private static void WriteUInt16(FakeCpuMemory memory, ulong address, ushort value)
+    {
+        Span<byte> buffer = stackalloc byte[2];
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer, value);
         Assert.True(memory.TryWrite(address, buffer));
     }
 

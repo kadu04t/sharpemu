@@ -119,6 +119,65 @@ public sealed class AvPlayerStreamInfoTests
         Assert.Equal(Generation.Gen5, export.Target);
     }
 
+    [Fact]
+    public void VideoOnlyPlayerReportsOneStreamAndRejectsAudioInfo()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var context = new CpuContext(memory, Generation.Gen5);
+        AvPlayerExports.RegisterPlayerForTest(
+            Handle,
+            1280,
+            720,
+            DurationMilliseconds,
+            hasAudioStream: false);
+
+        try
+        {
+            context[CpuRegister.Rdi] = Handle;
+            Assert.Equal(1, AvPlayerExports.AvPlayerStreamCount(context));
+
+            context[CpuRegister.Rsi] = 1;
+            context[CpuRegister.Rdx] = InfoAddress;
+            Assert.NotEqual(0, AvPlayerExports.AvPlayerGetStreamInfo(context));
+        }
+        finally
+        {
+            AvPlayerExports.RemovePlayerForTest(Handle);
+        }
+    }
+
+    [Fact]
+    public void PausedJumpUpdatesCurrentTimeAndKeepsPlayerActive()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var context = new CpuContext(memory, Generation.Gen5);
+        AvPlayerExports.RegisterPlayerForTest(
+            Handle,
+            1280,
+            720,
+            DurationMilliseconds,
+            hasAudioStream: false);
+
+        try
+        {
+            context[CpuRegister.Rdi] = Handle;
+            Assert.Equal(0, AvPlayerExports.AvPlayerPause(context));
+
+            const ulong targetMilliseconds = 1_234;
+            context[CpuRegister.Rsi] = targetMilliseconds;
+            Assert.Equal(0, AvPlayerExports.AvPlayerJumpToTime(context));
+
+            Assert.Equal(
+                unchecked((int)targetMilliseconds),
+                AvPlayerExports.AvPlayerCurrentTime(context));
+            Assert.Equal(1, AvPlayerExports.AvPlayerIsActive(context));
+        }
+        finally
+        {
+            AvPlayerExports.RemovePlayerForTest(Handle);
+        }
+    }
+
     private static int InvokeGetStreamInfo(CpuContext context, bool useExtendedFunction) =>
         useExtendedFunction
             ? AvPlayerExports.AvPlayerGetStreamInfoEx(context)

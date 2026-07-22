@@ -77,6 +77,31 @@ public sealed class PthreadMutexSemanticsTests
     }
 
     [Fact]
+    public void Destroy_ReleasesOpaqueMutexAndAttributeAllocations()
+    {
+        const ulong memoryBase = 0x1_1000_0000;
+        const ulong attrAddress = memoryBase + 0x100;
+        const ulong mutexAddress = memoryBase + 0x200;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var context = new CpuContext(memory, Generation.Gen5);
+
+        context[CpuRegister.Rdi] = attrAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexattrInit(context));
+        Assert.True(context.TryReadUInt64(attrAddress, out var attrHandle));
+        Assert.NotEqual(0UL, attrHandle);
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexattrDestroy(context));
+        Assert.True(memory.WasFreed(attrHandle));
+
+        context[CpuRegister.Rdi] = mutexAddress;
+        context[CpuRegister.Rsi] = 0;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexInit(context));
+        Assert.True(context.TryReadUInt64(mutexAddress, out var mutexHandle));
+        Assert.NotEqual(0UL, mutexHandle);
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexDestroy(context));
+        Assert.True(memory.WasFreed(mutexHandle));
+    }
+
+    [Fact]
     public async Task ContendedMutex_HandsOffOneHostWaiterAtATime()
     {
         const ulong memoryBase = 0x2_0000_0000;
@@ -270,6 +295,7 @@ public sealed class PthreadMutexSemanticsTests
     {
         private readonly ulong _baseAddress;
         private readonly byte[] _storage;
+        private readonly HashSet<ulong> _freedAddresses = new();
         private ulong _nextAllocation;
 
         public AllocatingCpuMemory(ulong baseAddress, int size)
@@ -316,8 +342,26 @@ public sealed class PthreadMutexSemanticsTests
             return true;
         }
 
-        public bool TryFreeGuestMemory(ulong address) =>
-            address >= _baseAddress && address < _baseAddress + (ulong)_storage.Length;
+        public bool TryFreeGuestMemory(ulong address)
+        {
+            if (address < _baseAddress || address >= _baseAddress + (ulong)_storage.Length)
+            {
+                return false;
+            }
+
+            lock (_freedAddresses)
+            {
+                return _freedAddresses.Add(address);
+            }
+        }
+
+        public bool WasFreed(ulong address)
+        {
+            lock (_freedAddresses)
+            {
+                return _freedAddresses.Contains(address);
+            }
+        }
 
         private bool TryResolve(ulong virtualAddress, int length, out int offset)
         {
@@ -399,6 +443,24 @@ public sealed class PthreadMutexSemanticsTests
             string reason,
             out string? error)
         {
+            error = null;
+            return false;
+        }
+
+        public bool TryCallGuestFunction(
+            CpuContext callerContext,
+            ulong entryPoint,
+            ulong arg0,
+            ulong arg1,
+            ulong arg2,
+            ulong arg3,
+            ulong stackAddress,
+            ulong stackSize,
+            string reason,
+            out ulong returnValue,
+            out string? error)
+        {
+            returnValue = 0;
             error = null;
             return false;
         }

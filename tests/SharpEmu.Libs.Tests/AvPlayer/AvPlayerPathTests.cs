@@ -186,6 +186,35 @@ public sealed class AvPlayerPathTests : IDisposable
         AssertPathIsInsideApp0(resolved);
     }
 
+    [Fact]
+    public void TemporarySourceScavengerRemovesOrphansAndPreservesLiveLeases()
+    {
+        var cacheDirectory = Path.Combine(_tempRoot, "avplayer-cache");
+        Directory.CreateDirectory(cacheDirectory);
+        var orphan = Path.Combine(cacheDirectory, "source-orphan.media");
+        var live = Path.Combine(cacheDirectory, "source-live.media");
+        File.WriteAllBytes(orphan, [0x01]);
+        File.WriteAllBytes(orphan + ".lock", []);
+        File.WriteAllBytes(live, [0x02]);
+
+        using (var liveLease = new FileStream(
+                   live + ".lock",
+                   FileMode.CreateNew,
+                   FileAccess.ReadWrite,
+                   FileShare.None))
+        {
+            Assert.Equal(1, AvPlayerExports.ScavengeOrphanedTemporarySources(cacheDirectory));
+            Assert.False(File.Exists(orphan));
+            Assert.False(File.Exists(orphan + ".lock"));
+            Assert.True(File.Exists(live));
+            Assert.True(File.Exists(live + ".lock"));
+        }
+
+        Assert.Equal(1, AvPlayerExports.ScavengeOrphanedTemporarySources(cacheDirectory));
+        Assert.False(File.Exists(live));
+        Assert.False(File.Exists(live + ".lock"));
+    }
+
     public void Dispose()
     {
         Environment.SetEnvironmentVariable("SHARPEMU_APP0_DIR", _originalApp0);

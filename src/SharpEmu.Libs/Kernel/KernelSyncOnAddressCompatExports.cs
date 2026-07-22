@@ -47,6 +47,43 @@ public static class KernelSyncOnAddressCompatExports
     // already satisfied and the guest correctly resumes at once.
     private static readonly ConcurrentDictionary<ulong, long> _wakeGenerations = new();
 
+    // --- TEMP DIAGNOSTIC (remove after investigation) ---
+    private static readonly bool _logSyncOnAddress = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_SYNC_ON_ADDRESS"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly string? _syncLogTriggerFile =
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_SYNC_ON_ADDRESS_TRIGGER_FILE");
+    private static volatile bool _syncLogTriggerObserved;
+    private static readonly Timer? _syncLogTriggerPoller = CreateSyncLogTriggerPoller();
+    private static readonly ConcurrentDictionary<ulong, long> _waitLogCounts = new();
+    private static long _wakeLogCount;
+    // --- END TEMP DIAGNOSTIC ---
+
+    private static bool SyncDiagnosticsEnabled =>
+        _logSyncOnAddress &&
+        (string.IsNullOrWhiteSpace(_syncLogTriggerFile) || _syncLogTriggerObserved);
+
+    private static Timer? CreateSyncLogTriggerPoller()
+    {
+        if (!_logSyncOnAddress || string.IsNullOrWhiteSpace(_syncLogTriggerFile))
+        {
+            return null;
+        }
+
+        return new Timer(
+            static _ =>
+            {
+                if (!_syncLogTriggerObserved && File.Exists(_syncLogTriggerFile))
+                {
+                    _syncLogTriggerObserved = true;
+                }
+            },
+            null,
+            TimeSpan.Zero,
+            TimeSpan.FromMilliseconds(250));
+    }
+
     private static long CurrentGeneration(ulong address) =>
         _wakeGenerations.TryGetValue(address, out var generation) ? generation : 0;
 
@@ -68,6 +105,25 @@ public static class KernelSyncOnAddressCompatExports
         var observedGeneration = CurrentGeneration(address);
         var deadline = GuestThreadExecution.ComputeDeadlineTimestamp(WaitSelfHealTimeout);
 
+        // --- TEMP DIAGNOSTIC (remove after investigation) ---
+        if (SyncDiagnosticsEnabled)
+        {
+            var callCount = _waitLogCounts.AddOrUpdate(address, 1, static (_, current) => current + 1);
+            // Log the first 5 calls per address, then every 500th, to avoid
+            // flooding the console while still showing whether this address
+            // keeps getting called and whether IsGuestThread flips.
+            if (callCount <= 5 || callCount % 500 == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[SYNCDIAG] wait addr=0x{address:X16} call#{callCount} " +
+                    $"managed={Environment.CurrentManagedThreadId} " +
+                    $"is_guest_thread={GuestThreadExecution.IsGuestThread} " +
+                    $"guest_handle=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+                    $"observed_gen={observedGeneration} current_gen={CurrentGeneration(address)}");
+            }
+        }
+        // --- END TEMP DIAGNOSTIC ---
+
         // Cooperative path: stay parked until a wake bumps this address's
         // generation (or the deadline expires as a self-heal). The guest
         // re-evaluates its own condition after resuming.
@@ -81,6 +137,19 @@ public static class KernelSyncOnAddressCompatExports
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
+
+        // --- TEMP DIAGNOSTIC (remove after investigation) ---
+        if (SyncDiagnosticsEnabled)
+        {
+            var callCount = _waitLogCounts.TryGetValue(address, out var current) ? current : 0;
+            if (callCount <= 5 || callCount % 500 == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[SYNCDIAG] wait addr=0x{address:X16} FELL THROUGH to host-gate fallback " +
+                    $"(RequestCurrentThreadBlock returned false) managed={Environment.CurrentManagedThreadId}");
+            }
+        }
+        // --- END TEMP DIAGNOSTIC ---
 
         // Non-cooperative caller (host main thread): bounded host wait so a
         // missed wake self-heals instead of hanging.
@@ -113,6 +182,22 @@ public static class KernelSyncOnAddressCompatExports
         // value = wake-all); default to all if it looks unset.
         var requested = unchecked((long)ctx[CpuRegister.Rsi]);
         var wakeCount = requested is > 0 and < int.MaxValue ? (int)requested : int.MaxValue;
+
+        // --- TEMP DIAGNOSTIC (remove after investigation) ---
+        if (SyncDiagnosticsEnabled)
+        {
+            var wakeLogIndex = Interlocked.Increment(ref _wakeLogCount);
+            if (wakeLogIndex <= 50 || wakeLogIndex % 100 == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[SYNCDIAG] wake addr=0x{address:X16} call#{wakeLogIndex} requested={requested} " +
+                    $"managed={Environment.CurrentManagedThreadId} " +
+                    $"is_guest_thread={GuestThreadExecution.IsGuestThread} " +
+                    $"guest_handle=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+                    $"has_waiters_registered={_waitLogCounts.ContainsKey(address)}");
+            }
+        }
+        // --- END TEMP DIAGNOSTIC ---
 
         // Bump the generation first so a wait that has registered but not yet
         // parked sees the change and resumes instead of missing this wake.
